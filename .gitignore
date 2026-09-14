@@ -26,3 +26,8 @@ env/
 # whatever an error message happened to contain). Build artifact, not source.
 dashboard.html
 dashboard_artifact.html
+
+# Local dual-repo tooling. Belongs to this checkout, not to either published
+# repo -- it hardcodes local paths and is specific to the fork arrangement.
+sync_public.py
+push_both.bat
