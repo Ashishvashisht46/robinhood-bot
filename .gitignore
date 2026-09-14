@@ -1,0 +1,28 @@
+# Environment variables & secrets (CRITICAL)
+.env
+.env.local
+.env.*.local
+
+# Telegram session files (CRITICAL - contains auth tokens)
+*.session
+*.session-journal
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+cache/
+
+# Logs
+logs/
+*.log
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Generated dashboard output - inlines live log data (balances, tx hashes, and
+# whatever an error message happened to contain). Build artifact, not source.
+dashboard.html
+dashboard_artifact.html

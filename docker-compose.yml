@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  robinhood-copytrader:
+    build: .
+    container_name: robinhood_bot
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./robinhood_copy_trader_session.session:/app/robinhood_copy_trader_session.session
