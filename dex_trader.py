@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import logging
+from execution_guard import ExecutionUncertain, PreflightFailure
 import asyncio
 from chain_client import eip1559_fees
 import time
@@ -13,6 +14,8 @@ import eth_abi
 try:
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf-8')
+except (ExecutionUncertain, PreflightFailure):
+    raise
 except Exception:
     pass
 
@@ -271,6 +274,8 @@ def get_price_eth_dexscreener(token: str) -> float:
             return float(native)
         usd = float(p.get("priceUsd") or 0)
         return usd / 2450.0 if usd else 0.0  # rough ETH usd; replace with your live ETH price if you have it
+    except (ExecutionUncertain, PreflightFailure):
+        raise
     except Exception:
         return 0.0
 
@@ -299,8 +304,13 @@ class DexTrader:
         self.v4_quoter = self.w3.eth.contract(address=self.w3.to_checksum_address(UNISWAP_V4_QUOTER), abi=V4_QUOTER_ABI)
         self.stock_v4   = StockV4Router(self.w3, self.chain.account if hasattr(self.chain, 'account') else None)
 
+        self.stock_v4.quote_v3 = self._quote_v3
+        self.stock_v4.quote_v4 = self._quote_v4
+        self.stock_v4.scan_workers = getattr(config, "RPC_SCAN_WORKERS", 4)
+        self._probe_slots = asyncio.Semaphore(getattr(config, "RPC_SCAN_WORKERS", 4))
+
         # Venues with pre-flight simulation disabled (Default: only LAUNCHPAD_CURVE_ETH)
-        self.no_sim_venues = {"LAUNCHPAD_CURVE_ETH"}
+        self.no_sim_venues = set()
 
         # O(1) Route Cache: once a token's venue/route is resolved, never re-run
         # the full detection cascade (incl. DexScreener + on-chain probes) for it
@@ -339,6 +349,8 @@ class DexTrader:
                         c_addr = self.w3.to_checksum_address(v[0]) if v[0] else None
                         p_tok = self.w3.to_checksum_address(v[1]) if v[1] else "0x" + "0"*40
                         self._curve_cache[self.w3.to_checksum_address(k)] = (c_addr, p_tok)
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception as e:
             logger.debug(f"Curve cache load warning: {e}")
 
@@ -348,6 +360,8 @@ class DexTrader:
             data = {k: list(v) for k, v in self._curve_cache.items()}
             with open(self._curve_cache_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception as e:
             logger.debug(f"Curve cache save warning: {e}")
 
@@ -356,6 +370,8 @@ class DexTrader:
         # detect_venue_and_route(), putting ~700ms onto the very first snipe.
         try:
             await self.verify_chain_id()
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception as e:
             logger.error(f"Chain ID verification failed at startup: {e}")
         logger.info(f"Initialized DexTrader on Chain ID 4663 with Universal Router: {self.uni_router_address}")
@@ -390,6 +406,8 @@ class DexTrader:
                 grad_sel = self.w3.keccak(text="graduated()")[:4]
                 res = await asyncio.to_thread(self.w3.eth.call, {'to': c_addr, 'data': grad_sel})
                 is_grad = bool(int(res.hex(), 16))
+            except (ExecutionUncertain, PreflightFailure):
+                raise
             except Exception:
                 pass
             if is_grad:
@@ -415,6 +433,8 @@ class DexTrader:
                     pair_res = await asyncio.to_thread(self.w3.eth.call, {'to': c_addr, 'data': pair_sel})
                     if len(pair_res.hex()) >= 40:
                         p_tok = self.w3.to_checksum_address('0x' + pair_res.hex()[-40:])
+                except (ExecutionUncertain, PreflightFailure):
+                    raise
                 except Exception:
                     pass
 
@@ -422,6 +442,8 @@ class DexTrader:
                     grad_sel = self.w3.keccak(text="graduated()")[:4].hex()
                     grad_res = await asyncio.to_thread(self.w3.eth.call, {'to': c_addr, 'data': grad_sel})
                     is_grad = bool(int(grad_res.hex(), 16))
+                except (ExecutionUncertain, PreflightFailure):
+                    raise
                 except Exception:
                     pass
 
@@ -433,6 +455,8 @@ class DexTrader:
                     self._curve_cache[token_cs] = (None, p_tok)
                     self._save_curve_cache()
                     return None, p_tok, True
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception:
             pass
 
@@ -452,6 +476,8 @@ class DexTrader:
                     self._curve_cache[token_cs] = (None, "0x" + "0"*40)
                     self._save_curve_cache()
                     return None, "0x" + "0"*40, True
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception:
             pass
 
@@ -486,6 +512,8 @@ class DexTrader:
                     grad_sel = self.w3.keccak(text='graduated()')[:4].hex()
                     res = await asyncio.to_thread(self.w3.eth.call, {'to': c_addr, 'data': grad_sel})
                     is_grad = bool(int(res.hex(), 16))
+                except (ExecutionUncertain, PreflightFailure):
+                    raise
                 except Exception:
                     pass
 
@@ -497,6 +525,8 @@ class DexTrader:
                     self._curve_cache[token_cs] = (None, p_tok)
                     self._save_curve_cache()
                     return None, p_tok, True
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception as e:
             logger.debug(f"Pons V2 event query failed for {token_cs}: {e}")
 
@@ -512,6 +542,8 @@ class DexTrader:
                 self.w3.to_checksum_address(address)
             )
             return code not in (b'', b'0x', '0x', None, '')
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception:
             return False
 
@@ -624,6 +656,8 @@ class DexTrader:
             if best is None:
                 try:
                     probed_native = self.stock_v4.probe_v4_key(token_cs, ZERO)
+                except (ExecutionUncertain, PreflightFailure):
+                    raise
                 except Exception:
                     probed_native = None
                 if probed_native:
@@ -652,6 +686,8 @@ class DexTrader:
         for candidate_quote in self._v4_candidate_quotes(quote_asset):
             try:
                 probed = self.stock_v4.probe_v4_key(token_cs, candidate_quote)
+            except (ExecutionUncertain, PreflightFailure):
+                raise
             except Exception:
                 probed = None
             if probed:
@@ -697,6 +733,8 @@ class DexTrader:
             try:
                 liq = await asyncio.to_thread(
                     self._v4_pool_liquidity, ZERO, token_cs, fee, tick, hook)
+            except (ExecutionUncertain, PreflightFailure):
+                raise
             except Exception:
                 continue
             if liq and (best is None or liq > best[0]):
@@ -704,6 +742,10 @@ class DexTrader:
         if best:
             return best[1], best[2], best[3]
         return None
+
+    async def _limited_probe(self, function, *args):
+        async with self._probe_slots:
+            return await asyncio.to_thread(function, *args)
 
     async def _detect_venue_and_route_uncached(self, token_address: str) -> Tuple[str, str, str, int]:
         """
@@ -747,6 +789,8 @@ class DexTrader:
         # and waiting on that miss just delays an answer already in hand.
         try:
             curve_addr, pair_token, is_graduated = await curve_task
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception as e:
             logger.debug(f"Curve resolution failed for {token_cs}: {e}")
             curve_addr, pair_token, is_graduated = None, ZERO, False
@@ -779,6 +823,8 @@ class DexTrader:
                     return mapped["venue"], mapped["target"], mapped["quote"], mapped.get("fee", 0)
         except asyncio.TimeoutError:
             logger.debug(f"DexScreener fast-check timed out for {token_cs}, falling through to on-chain checks")
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception as e:
             logger.debug(f"DexScreener fast-check failed: {e}")
         # ==============================================================
@@ -788,17 +834,19 @@ class DexTrader:
         # 2. Parallel V3 WETH & V3 USDG Liquidity Probes
         async def check_v3_pool(quote_asset: str, fee: int, tag: str):
             try:
-                pool_addr = await asyncio.to_thread(self.v3_factory.functions.getPool(quote_asset, token_cs, fee).call)
+                pool_addr = await self._limited_probe(self.v3_factory.functions.getPool(quote_asset, token_cs, fee).call)
                 if pool_addr and pool_addr != ZERO:
                     pool_contract = self.w3.eth.contract(address=pool_addr, abi=[
                         {"inputs":[],"name":"liquidity","outputs":[{"type":"uint128"}],"stateMutability":"view","type":"function"},
                         {"inputs":[],"name":"slot0","outputs":[{"name":"sqrtPriceX96","type":"uint160"},{"name":"tick","type":"int24"}],"stateMutability":"view","type":"function"}
                     ])
-                    liq = await asyncio.to_thread(pool_contract.functions.liquidity().call)
-                    slot0 = await asyncio.to_thread(pool_contract.functions.slot0().call)
+                    liq = await self._limited_probe(pool_contract.functions.liquidity().call)
+                    slot0 = await self._limited_probe(pool_contract.functions.slot0().call)
                     # sqrtPriceX96 == 0 means pool exists but was never initialized (swap will revert)
                     if liq > 0 and slot0[0] > 0:
                         return f"UNISWAP_V3_{tag}", pool_addr, quote_asset, fee
+            except (ExecutionUncertain, PreflightFailure):
+                raise
             except Exception:
                 pass
             return None
@@ -816,12 +864,14 @@ class DexTrader:
         # 3. Check against stock tokens (V3 / V4 style pools)
         async def check_stock_pool(stock_addr: str, fee: int):
             try:
-                pool_addr = await asyncio.to_thread(self.v3_factory.functions.getPool(stock_addr, token_cs, fee).call)
+                pool_addr = await self._limited_probe(self.v3_factory.functions.getPool(stock_addr, token_cs, fee).call)
                 if pool_addr and pool_addr != ZERO:
                     liq_contract = self.w3.eth.contract(address=pool_addr, abi=[{"inputs":[],"name":"liquidity","outputs":[{"type":"uint128"}],"stateMutability":"view","type":"function"}])
-                    liq = await asyncio.to_thread(liq_contract.functions.liquidity().call)
+                    liq = await self._limited_probe(liq_contract.functions.liquidity().call)
                     if liq > 0:
                         return "STOCK_PAIR", pool_addr, stock_addr, fee
+            except (ExecutionUncertain, PreflightFailure):
+                raise
             except Exception:
                 pass
             return None
@@ -845,12 +895,14 @@ class DexTrader:
         # 4. Uniswap V2 Pair fallback (Parallel)
         async def check_v2_pair(quote_asset: str, tag: str):
             try:
-                pair_addr = await asyncio.to_thread(self.v2_factory.functions.getPair(quote_asset, token_cs).call)
+                pair_addr = await self._limited_probe(self.v2_factory.functions.getPair(quote_asset, token_cs).call)
                 if pair_addr and pair_addr != ZERO:
                     res_contract = self.w3.eth.contract(address=pair_addr, abi=[{"inputs":[],"name":"getReserves","outputs":[{"type":"uint112"},{"type":"uint112"},{"type":"uint32"}],"stateMutability":"view","type":"function"}])
-                    res = await asyncio.to_thread(res_contract.functions.getReserves().call)
+                    res = await self._limited_probe(res_contract.functions.getReserves().call)
                     if res[0] > 0 and res[1] > 0:
                         return f"UNISWAP_V2_{tag}", UNISWAP_V2_ROUTER, quote_asset, 0
+            except (ExecutionUncertain, PreflightFailure):
+                raise
             except Exception:
                 pass
             return None
@@ -892,23 +944,21 @@ class DexTrader:
     async def force_buy_v4_or_stock(self, token: str, amount_eth: float, slippage_pct: float = 15.0,
                                     fee: int = 3000, tick: int = 60, hook: str = "0x" + "0"*40) -> Tuple[str, float]:
         """
-        Aggressive forced buy for V4 / Stock-paired tokens - NO SIMULATION.
-        Builds multi-hop / V4 swap via Universal Router and broadcasts directly.
+        Fallback V4 buy with a quote, simulation, and journaled broadcast.
         """
         token = self.w3.to_checksum_address(token)
         amount_wei = self.w3.to_wei(amount_eth, "ether")
         recipient = self.chain.account.address if self.chain.account else ZERO
 
-        print(f"⚡ FORCED BUY (No Sim) for {token}")
-        logger.info(f"⚡ FORCED BUY (No Sim) for {token} with {amount_eth} ETH")
+        print(f"⚡ FALLBACK BUY (Simulated) for {token}")
+        logger.info(f"⚡ FALLBACK BUY (Simulated) for {token} with {amount_eth} ETH")
 
         if getattr(self.config, "DRY_RUN", True):
             fake_hash = f"DRY_RUN_0x{int(time.time())}"
             logger.info(f"[DRY RUN] Forced V4/Stock buy simulated: {fake_hash}")
             return fake_hash, await self._dry_run_fill(token, amount_eth)
 
-        # This path deliberately skips simulation, so min_out is the only thing
-        # standing between a bad fill and the whole stake.
+        # The fallback enforces both a quoted output floor and simulation.
         min_out = await self.min_out_for(
             "UNISWAP_V4", token, ZERO, fee, amount_wei, self.uni_router_address, slippage_pct
         )
@@ -945,10 +995,10 @@ class DexTrader:
         # orders of magnitude, so the monitor stop-lossed seconds after entry.
         bal_before = await self._safe_token_balance(token)
 
-        signed = self.chain.account.sign_transaction(tx)
-        raw_tx_bytes = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
-        tx_hash_bytes = await asyncio.to_thread(self.w3.eth.send_raw_transaction, raw_tx_bytes)
-        tx_hash = self.w3.to_hex(tx_hash_bytes)
+        success, _ = await self.simulate_execution(tx, "UNISWAP_V4", self.uni_router_address, _cmds)
+        if not success:
+            return "", 0.0
+        tx_hash = await self.chain.send_transaction(tx)
         logger.info(f"⚡ Forced V4/Stock Buy Tx broadcasted: {tx_hash}")
         print(f"⚡ Forced V4/Stock Buy Tx: {tx_hash}")
 
@@ -975,6 +1025,8 @@ class DexTrader:
             logger.info(msg)
             print(f"🎉🎉🎉 {msg}")
             return True, f"gas: {gas_est}"
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception as e:
             revert_reason = str(e)
             msg = f"SIMULATION REVERT | Venue: {venue} | To: {target} | Revert: {revert_reason}"
@@ -1045,6 +1097,8 @@ class DexTrader:
         try:
             pid = pool_id_from_key(c0, c1, int(fee), int(tick), self.w3.to_checksum_address(hook))
             return int(self.state_view.functions.getLiquidity(pid).call())
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception:
             return 0
 
@@ -1054,6 +1108,8 @@ class DexTrader:
         try:
             pid = pool_id_from_key(c0, c1, int(fee), int(tick), self.w3.to_checksum_address(hook))
             return int(self.state_view.functions.getLiquidity(pid).call()) > 0
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception:
             return False
 
@@ -1322,25 +1378,21 @@ class DexTrader:
     # ─── Public Buy / Sell ────────────────────────────────────────────────
 
     async def _dry_run_fill(self, token_address: str, eth_amount: float) -> float:
-        """
-        Token count for a simulated buy, priced off the real pool.
-
-        Paper mode used to return eth_amount * 1000, which made the entry price
-        (stake / tokens) wrong by orders of magnitude -- so every paper position
-        showed a 0.00x multiplier and instantly stop-lossed. That made DRY_RUN
-        useless for testing the exit ladder, which is the main reason to run it.
-        """
+        """Paper entry at a route quote, including the configured slippage assumption."""
         try:
-            tokens = await self.estimate_tokens_for_eth(token_address, eth_amount)
-            if tokens and tokens > 0:
-                return float(tokens)
-        except Exception as e:
-            logger.debug(f"Dry-run fill estimate failed for {token_address}: {e}")
-        logger.warning(
-            f"[DRY RUN] No live price for {token_address}; falling back to a nominal "
-            f"fill. The ladder will not behave realistically for this position."
-        )
-        return eth_amount * 1000.0
+            venue, target, quote, fee = await self.detect_venue_and_route(token_address)
+            expected = await asyncio.to_thread(
+                self._quote_route, venue, token_address, quote, fee,
+                self.w3.to_wei(eth_amount, "ether"), target, False)
+            if expected and expected > 0:
+                decimals = await self.chain.get_token_decimals(token_address)
+                return expected / 10**decimals * (1 - self.config.PAPER_SLIPPAGE_PCT / 100)
+        except (ExecutionUncertain, PreflightFailure):
+            raise
+        except Exception as exc:
+            logger.warning("Paper quote unavailable for %s: %s", token_address, exc)
+        logger.warning("[DRY RUN] No route quote for %s; refusing to invent a fill", token_address)
+        return 0.0
 
     async def buy_token(self, token_address: str, eth_amount: float, slippage_pct: float, start_time: Optional[float] = None) -> Tuple[str, float]:
         if start_time is None:
@@ -1364,6 +1416,8 @@ class DexTrader:
                     asyncio.to_thread(self.stock_v4.detect, token_address),
                     timeout=8.0,
                 )
+            except (ExecutionUncertain, PreflightFailure):
+                raise
             except Exception as e:
                 logger.warning(f"stock_v4.detect skipped/timed out: {e}")
                 info = {}
@@ -1395,6 +1449,8 @@ class DexTrader:
                 try:
                     tx_res = await asyncio.to_thread(self.stock_v4.buy, token_address, eth_amount)
                     tx_hash = tx_res[1] if isinstance(tx_res, tuple) else tx_res
+                except (ExecutionUncertain, PreflightFailure):
+                    raise
                 except Exception as e:
                     logger.warning(f"stock_v4 skip {token_address} {e}")
                     tx_hash = None
@@ -1418,6 +1474,8 @@ class DexTrader:
                                 v4_fee, v4_tick, v4_hook
                             )
                         tx_hash = res[1] if isinstance(res, tuple) else res
+                    except (ExecutionUncertain, PreflightFailure):
+                        raise
                     except Exception as e:
                         logger.error(f"Fallback two-tx buy failed for {token_address} quote={quote_asset}: {e}")
 
@@ -1495,6 +1553,8 @@ class DexTrader:
                             got = await self._measure_fill(token_address, bal_before)
                             if receipt.get("status", 0) == 1 and got > 0:
                                 return tx2, got
+                except (ExecutionUncertain, PreflightFailure):
+                    raise
                 except Exception as e:
                     logger.warning(f"buy_usdg_two_tx failed for {token_address}: {e}")
                 # No atomic fallback here on purpose. build_v4_usdg_2hop_tx has never
@@ -1528,6 +1588,8 @@ class DexTrader:
                             hook
                         )
                         break
+                    except (ExecutionUncertain, PreflightFailure):
+                        raise
                     except Exception as e:
                         last_err = e
                         logger.warning(f"Stock two-tx buy attempt {attempt + 1}/2 failed for {token_address}: {e}")
@@ -1541,6 +1603,8 @@ class DexTrader:
                 # real tokens received instead of assuming a fixed amount.
                 try:
                     await self.chain.wait_for_receipt(tx2)
+                except (ExecutionUncertain, PreflightFailure):
+                    raise
                 except Exception as e:
                     logger.warning(f"Could not confirm stock-leg buy receipt for {token_address}: {e}")
                 tokens_received = await self._measure_fill(token_address, bal_before)
@@ -1567,6 +1631,8 @@ class DexTrader:
                     if allowance < quote_in_usdg:
                         logger.info(f"Approving USDG Curve {target_addr} for USDG spending...")
                         await self.chain.approve_token(self.usdg_address, target_addr, 2**256 - 1)
+                except (ExecutionUncertain, PreflightFailure):
+                    raise
                 except Exception as e:
                     logger.warning(f"USDG approval/balance check to curve {target_addr} failed: {e}")
 
@@ -1687,6 +1753,8 @@ class DexTrader:
                                 got = await self.chain.get_token_balance(token_address) - fb_bal_before
                                 if got > 0:
                                     return tx_hash, got
+                        except (ExecutionUncertain, PreflightFailure):
+                            raise
                         except Exception as e:
                             logger.warning(f"Fallback USDG two-tx buy failed: {e}")
                     else:
@@ -1705,10 +1773,14 @@ class DexTrader:
                             # tokens received instead of assuming a fixed amount.
                             try:
                                 await self.chain.wait_for_receipt(tx2)
+                            except (ExecutionUncertain, PreflightFailure):
+                                raise
                             except Exception as e:
                                 logger.warning(f"Could not confirm fallback stock-leg receipt for {token_address}: {e}")
                             fb_tokens_received = await self._measure_fill(token_address, fb_bal_before)
                             return tx2, fb_tokens_received if fb_tokens_received > 0 else 0.0
+                        except (ExecutionUncertain, PreflightFailure):
+                            raise
                         except Exception as e:
                             logger.warning(f"Stock two-tx fallback failed: {e}")
 
@@ -1737,8 +1809,12 @@ class DexTrader:
                                 received = await self._measure_fill(token_address, v2_bal_before)
                                 if received > 0:
                                     return tx_hash, received
+                        except (ExecutionUncertain, PreflightFailure):
+                            raise
                         except Exception as e:
                             logger.warning(f"Fallback V2 sim failed: {e}")
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception as e:
             logger.warning(f"Fallback detection failed: {e}")
 
@@ -1750,6 +1826,8 @@ class DexTrader:
             tx_hash, received = await self.force_buy_v4_or_stock(token_address, eth_amount, slippage_pct)
             if tx_hash and received > 0:
                 return tx_hash, received
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception as e:
             logger.error(f"No-sim V4 last resort failed: {e}")
 
@@ -1776,6 +1854,8 @@ class DexTrader:
         token_contract = self.w3.eth.contract(address=token_address, abi=ERC20_ABI)
         try:
             decimals = await self.chain._retry(token_contract.functions.decimals().call)
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception:
             decimals = 18
 
@@ -1852,6 +1932,8 @@ class DexTrader:
                     if receipt.get("status", 0) == 1 and tokens_sold > 0:
                         logger.info(f"✅ V4/stock sell filled: {tokens_sold:.4f} tokens tx={txh}")
                         return txh, tokens_sold
+            except (ExecutionUncertain, PreflightFailure):
+                raise
             except Exception as e:
                 logger.warning(f"sell_to_eth failed ({venue} quote={quote_asset}): {e}")
 
@@ -1864,6 +1946,8 @@ class DexTrader:
                 tx = tx_v4
                 spender = self.uni_router_address
                 venue = "UNISWAP_V4"
+            except (ExecutionUncertain, PreflightFailure):
+                raise
             except Exception as e:
                 logger.error(f"Failed to build V4 sell tx for {token_address}: {e}")
                 return "", 0.0
@@ -2025,6 +2109,8 @@ class DexTrader:
                 return int(self.v3_quoter.functions.quoteExactInput(path, int(amount_in)).call()[0])
             return int(self.v3_quoter.functions.quoteExactInputSingle(
                 (cs(token_in), cs(token_out), int(amount_in), int(fee), 0)).call()[0])
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception as e:
             logger.debug(f"V3 quote failed {token_in}->{token_out} fee={fee} via={via}: {e}")
             return None
@@ -2038,6 +2124,8 @@ class DexTrader:
             return int(self.v4_quoter.functions.quoteExactInputSingle(
                 ((c0, c1, int(fee), int(tick), cs(hook)), c0.lower() == a.lower(),
                  int(amount_in), b'')).call()[0])
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception as e:
             logger.debug(f"V4 quote failed {a}->{b} fee={fee} tick={tick}: {e}")
             return None
@@ -2048,6 +2136,8 @@ class DexTrader:
             amounts = self.v2_router.functions.getAmountsOut(
                 int(amount_in), [cs(token_in), cs(token_out)]).call()
             return int(amounts[-1])
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception as e:
             logger.debug(f"V2 quote failed {token_in}->{token_out}: {e}")
             return None
@@ -2072,6 +2162,8 @@ class DexTrader:
             if r_in <= 0 or r_out <= 0:
                 return None
             return int((int(amount_in) * r_out) // (r_in + int(amount_in)))
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception as e:
             logger.debug(f"Curve quote failed {curve_address}: {e}")
             return None
@@ -2145,6 +2237,8 @@ class DexTrader:
         for attempt in range(3):
             try:
                 return await self.chain.get_token_balance(token_address)
+            except (ExecutionUncertain, PreflightFailure):
+                raise
             except Exception as e:
                 logger.warning(f"Balance read failed for {token_address} ({attempt + 1}/3): {e}")
                 await asyncio.sleep(0.5 * (attempt + 1))
@@ -2160,12 +2254,17 @@ class DexTrader:
         """
         after = await self._safe_token_balance(token_address)
         if after is None:
+            if getattr(self.chain, "execution_guard", None):
+                raise ExecutionUncertain("post-buy token balance unreadable")
             logger.critical(
                 f"Bought {token_address} but the balance is unreadable -- the position "
                 f"cannot be sized or monitored. Check this wallet manually."
             )
             return 0.0
         if bal_before is None:
+            guard = getattr(self.chain, "execution_guard", None)
+            if guard and guard.active:
+                return max(0.0, float(after) - guard.active["before"])
             # Starting balance unknown. Size from the full balance: the strategy
             # engine already refuses a second position in the same token
             # (strategy_engine.py:86), so a pre-existing balance is unlikely, and an
@@ -2175,7 +2274,11 @@ class DexTrader:
                 f"full balance {after}. Verify manually."
             )
             return float(after)
-        return max(0.0, float(after) - float(bal_before))
+        delta = max(0.0, float(after) - float(bal_before))
+        guard = getattr(self.chain, "execution_guard", None)
+        if delta <= 0 and guard and guard.active and guard.active["transactions"]:
+            raise ExecutionUncertain("submitted buy has no measured token delta")
+        return delta
 
     def usdg_leg_min_out(self, token_address: str, fee: int, tick: int, hook: str,
                          slippage_pct: float):
@@ -2218,6 +2321,8 @@ class DexTrader:
                 pool = await asyncio.to_thread(
                     self.v3_factory.functions.getPool(quote_cs, token_cs, candidate).call
                 )
+            except (ExecutionUncertain, PreflightFailure):
+                raise
             except Exception:
                 continue
             if pool and int(pool, 16) != 0:
@@ -2273,6 +2378,8 @@ class DexTrader:
                 token_contract = self.w3.eth.contract(address=token_cs, abi=ERC20_ABI)
                 try:
                     dec = await self.chain._retry(token_contract.functions.decimals().call)
+                except (ExecutionUncertain, PreflightFailure):
+                    raise
                 except Exception:
                     dec = 18
 
@@ -2299,6 +2406,8 @@ class DexTrader:
                 token_contract = self.w3.eth.contract(address=token_cs, abi=ERC20_ABI)
                 try:
                     dec = await self.chain._retry(token_contract.functions.decimals().call)
+                except (ExecutionUncertain, PreflightFailure):
+                    raise
                 except Exception:
                     dec = 18
 
@@ -2336,6 +2445,8 @@ class DexTrader:
                     token_contract = self.w3.eth.contract(address=token_cs, abi=ERC20_ABI)
                     try:
                         dec = await self.chain._retry(token_contract.functions.decimals().call)
+                    except (ExecutionUncertain, PreflightFailure):
+                        raise
                     except Exception:
                         dec = 18
 
@@ -2383,6 +2494,8 @@ class DexTrader:
                 token_contract = self.w3.eth.contract(address=token_cs, abi=ERC20_ABI)
                 try:
                     dec = await self.chain._retry(token_contract.functions.decimals().call)
+                except (ExecutionUncertain, PreflightFailure):
+                    raise
                 except Exception:
                     dec = 18
 
@@ -2421,6 +2534,8 @@ class DexTrader:
                     token_contract = self.w3.eth.contract(address=token_cs, abi=ERC20_ABI)
                     try:
                         dec = await self.chain._retry(token_contract.functions.decimals().call)
+                    except (ExecutionUncertain, PreflightFailure):
+                        raise
                     except Exception:
                         dec = 18
                     if t0.lower() == token_cs.lower():
@@ -2435,6 +2550,8 @@ class DexTrader:
                             eth_price_usd = await self.chain.get_eth_price_usd()
                             return px_usdg / eth_price_usd if eth_price_usd > 0 else 0.0
 
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception as e:
             logger.debug(f"Error fetching token price in ETH for {token_address}: {e}")
 
@@ -2445,6 +2562,8 @@ class DexTrader:
         # (position_monitor skips the tick rather than acting on noise).
         try:
             venue_now, _t, _q, _f = await self.detect_venue_and_route(token_cs)
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception:
             venue_now = "NONE"
         if venue_now == "NONE":
@@ -2518,6 +2637,8 @@ def force_simulate_usdg_curve(token_address: str, quote_amount_usdg: float = 1.0
         print(f"SIMULATION OK | Venue: LAUNCHPAD_CURVE_USDG | To: {curve_addr} | gas: {gas_estimate}")
         return True
 
+    except (ExecutionUncertain, PreflightFailure):
+        raise
     except Exception as e:
         print(f"SIMULATION REVERT | Venue: LAUNCHPAD_CURVE_USDG")
         print(f"Revert reason: {e}")
@@ -2579,6 +2700,8 @@ def force_simulate_v4_weth(token_address: str, eth_amount: float = 0.0002, w3=No
         print(f"SIMULATION OK | Venue: UNISWAP_V4_WETH | gas: {gas_estimate}")
         return True
 
+    except (ExecutionUncertain, PreflightFailure):
+        raise
     except Exception as e:
         print(f"SIMULATION REVERT | Venue: UNISWAP_V4_WETH")
         print(f"Revert: {e}")
@@ -2629,6 +2752,8 @@ def force_simulate_v3_usdg(token_address: str, eth_amount: float = 0.0002, w3=No
         print(f"SIMULATION OK | Venue: UNISWAP_V3_USDG | gas: {gas_estimate}")
         return True
 
+    except (ExecutionUncertain, PreflightFailure):
+        raise
     except Exception as e:
         print(f"SIMULATION REVERT | Venue: UNISWAP_V3_USDG")
         print(f"Revert: {e}")
@@ -2704,6 +2829,8 @@ def force_simulate_v4_usdg_2hop(token_address: str, eth_amount: float = 0.0002, 
         print(f"SIMULATION OK | Venue: UNISWAP_V4_USDG_2HOP | gas: {gas_estimate}")
         return True
 
+    except (ExecutionUncertain, PreflightFailure):
+        raise
     except Exception as e:
         print(f"SIMULATION REVERT | Venue: UNISWAP_V4_USDG_2HOP")
         print(f"Revert: {e}")
@@ -2744,6 +2871,8 @@ def sell_eth_curve(token: str, amount_tokens: float, min_out: int = 1, w3=None, 
     token_contract = w3.eth.contract(address=token, abi=ERC20_ABI)
     try:
         decimals = token_contract.functions.decimals().call()
+    except (ExecutionUncertain, PreflightFailure):
+        raise
     except Exception:
         decimals = 18
     amount_in = int(amount_tokens * (10**decimals))
@@ -2756,10 +2885,7 @@ def sell_eth_curve(token: str, amount_tokens: float, min_out: int = 1, w3=None, 
             "gas": 80000,
             "chainId": 4663
         })
-        signed = account.sign_transaction(approve_tx)
-        raw = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
-        tx_h = w3.eth.send_raw_transaction(raw).hex()
-        w3.eth.wait_for_transaction_receipt(tx_h, timeout=60)
+        raise RuntimeError("Approval required; standalone simulation helpers cannot broadcast. Use the guarded trader.")
 
     curve = w3.eth.contract(address=curve_addr, abi=PONS_CURVE_ABI)
     tx = curve.functions.sell(
@@ -2800,6 +2926,8 @@ def sell_usdg_curve(token: str, amount_tokens: float, min_out: int = 1, w3=None,
     token_contract = w3.eth.contract(address=token, abi=ERC20_ABI)
     try:
         decimals = token_contract.functions.decimals().call()
+    except (ExecutionUncertain, PreflightFailure):
+        raise
     except Exception:
         decimals = 18
     amount_in = int(amount_tokens * (10**decimals))
@@ -2812,10 +2940,7 @@ def sell_usdg_curve(token: str, amount_tokens: float, min_out: int = 1, w3=None,
             "gas": 80000,
             "chainId": 4663
         })
-        signed = account.sign_transaction(approve_tx)
-        raw = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
-        tx_h = w3.eth.send_raw_transaction(raw).hex()
-        w3.eth.wait_for_transaction_receipt(tx_h, timeout=60)
+        raise RuntimeError("Approval required; standalone simulation helpers cannot broadcast. Use the guarded trader.")
 
     curve = w3.eth.contract(address=curve_addr, abi=PONS_CURVE_ABI)
     tx = curve.functions.sell(
@@ -2839,6 +2964,8 @@ def sell_v3_weth(token: str, amount_tokens: float, min_out: int = 1, w3=None, ac
     token_contract = w3.eth.contract(address=token, abi=ERC20_ABI)
     try:
         decimals = token_contract.functions.decimals().call()
+    except (ExecutionUncertain, PreflightFailure):
+        raise
     except Exception:
         decimals = 18
     amount_in = int(amount_tokens * (10**decimals))
@@ -2852,10 +2979,7 @@ def sell_v3_weth(token: str, amount_tokens: float, min_out: int = 1, w3=None, ac
             "gas": 80000,
             "chainId": 4663
         })
-        signed = account.sign_transaction(approve_tx)
-        raw = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
-        tx_h = w3.eth.send_raw_transaction(raw).hex()
-        w3.eth.wait_for_transaction_receipt(tx_h, timeout=60)
+        raise RuntimeError("Approval required; standalone simulation helpers cannot broadcast. Use the guarded trader.")
 
     router_contract = w3.eth.contract(address=router, abi=SWAP_ROUTER02_ABI)
     params = (token, w3.to_checksum_address(WETH_ADDRESS), fee, account.address, amount_in, min_out, 0)
@@ -2879,6 +3003,8 @@ def sell_v3_usdg(token: str, amount_tokens: float, min_out: int = 1, w3=None, ac
     token_contract = w3.eth.contract(address=token, abi=ERC20_ABI)
     try:
         decimals = token_contract.functions.decimals().call()
+    except (ExecutionUncertain, PreflightFailure):
+        raise
     except Exception:
         decimals = 18
     amount_in = int(amount_tokens * (10**decimals))
@@ -2892,10 +3018,7 @@ def sell_v3_usdg(token: str, amount_tokens: float, min_out: int = 1, w3=None, ac
             "gas": 80000,
             "chainId": 4663
         })
-        signed = account.sign_transaction(approve_tx)
-        raw = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
-        tx_h = w3.eth.send_raw_transaction(raw).hex()
-        w3.eth.wait_for_transaction_receipt(tx_h, timeout=60)
+        raise RuntimeError("Approval required; standalone simulation helpers cannot broadcast. Use the guarded trader.")
 
     # Path: Token -> (fee1) -> USDG -> (fee2) -> WETH
     path_bytes = (
@@ -2939,6 +3062,8 @@ def sell_token(token_address: str, amount_tokens: float, min_out: int = 1, w3=No
         if tx_hash:
             return tx_hash
         return None
+    except (ExecutionUncertain, PreflightFailure):
+        raise
     except Exception as e:
         print(f"Sell execution failed: {e}")
         return None
@@ -2957,6 +3082,8 @@ def force_simulate_sell(token_address: str, amount_tokens: float = 1000, w3=None
         gas_estimate = w3.eth.estimate_gas(tx)
         print(f"SIMULATION OK | Sell gas: {gas_estimate}")
         return True
+    except (ExecutionUncertain, PreflightFailure):
+        raise
     except Exception as e:
         print(f"SIMULATION REVERT | {e}")
         return False

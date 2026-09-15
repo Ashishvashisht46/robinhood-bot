@@ -1,3 +1,4 @@
+from execution_guard import ExecutionUncertain, PreflightFailure
 # stock_v4_routes.py
 # Drop-in routes for Robinhood Chain 4663
 # Covers: V3 stock pairs + V4 Native/WETH/USDG/stock pairs + V2 fallback + DexScreener Fallback
@@ -387,6 +388,8 @@ class StockV4Router:
             if liq <= 0:
                 return None
             return _cs(pool)
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception:
             return None
 
@@ -399,6 +402,8 @@ class StockV4Router:
         pid = pool_id_from_key(c0, c1, fee, tick, hook)
         try:
             liq = self.state_view.functions.getLiquidity(pid).call()
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception:
             return False
         return int(liq) > 0
@@ -412,6 +417,8 @@ class StockV4Router:
             if res[0] > 0 and res[1] > 0:
                 return _cs(pair)
             return None
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception:
             return None
 
@@ -430,12 +437,15 @@ class StockV4Router:
         your endpoint. If you're on a rate-limited free tier, tune max_workers
         down (or the RPC provider may start throttling you instead).
         """
+        max_workers = min(max_workers, getattr(self, "scan_workers", 4))
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = [ex.submit(fn) for fn in fns]
             try:
                 for fut in concurrent.futures.as_completed(futures):
                     try:
                         res = fut.result()
+                    except (ExecutionUncertain, PreflightFailure):
+                        raise
                     except Exception:
                         res = None
                     if res:
@@ -455,6 +465,8 @@ class StockV4Router:
                 mapped = map_ds_pair(token, p, self.w3)
                 if mapped.get("venue") != "NONE":
                     return mapped
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception:
             pass
 
@@ -539,11 +551,55 @@ class StockV4Router:
         return eip1559_fees(self.w3)
 
     def _send(self, tx):
+        guard = getattr(self, "execution_guard", None)
+        if not guard or guard.config.DRY_RUN:
+            raise ExecutionUncertain("live stock-route submission requires an active execution guard")
+        tx["nonce"] = self.w3.eth.get_transaction_count(self.account.address, "pending")
+        if "gasPrice" not in tx:
+            tx["maxFeePerGas"], tx["maxPriorityFeePerGas"] = self._gas_fees()
         signed = self.account.sign_transaction(tx)
         raw = getattr(signed, "rawTransaction", None) or getattr(signed, "raw_transaction")
-        return self.w3.eth.send_raw_transaction(raw).hex()
+        tx_hash = self.w3.to_hex(self.w3.keccak(raw))
+        guard.before_send(tx_hash, tx)
+        try:
+            self.w3.eth.send_raw_transaction(raw)
+        except (ExecutionUncertain, PreflightFailure):
+            raise
+        except Exception as exc:
+            if "already known" not in str(exc).lower():
+                raise ExecutionUncertain(f"stock-route broadcast outcome unknown: {tx_hash}") from exc
+        return tx_hash
+
+    def _wait_receipt(self, tx_hash, timeout=60):
+        try:
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+        except (ExecutionUncertain, PreflightFailure):
+            raise
+        except Exception as exc:
+            raise ExecutionUncertain(f"stock-route receipt unknown: {tx_hash}") from exc
+        guard = getattr(self, "execution_guard", None)
+        if guard:
+            guard.receipt(tx_hash, receipt)
+        if receipt.get("status") != 1:
+            raise ExecutionUncertain(f"stock-route transaction reverted: {tx_hash}")
+        return receipt
+
+    def _floor(self, expected):
+        if expected is None or int(expected) <= 1:
+            raise RuntimeError("Route has no usable quote; refusing an unprotected swap")
+        pct = self.execution_guard.config.SLIPPAGE_PCT if getattr(self, "execution_guard", None) else 0
+        return max(1, int(int(expected) * (1 - pct / 100)))
+
+    def _v3_floor(self, path, fees, amount):
+        for token_in, token_out, fee in zip(path, path[1:], fees):
+            amount = self.quote_v3(token_in, token_out, amount, fee)
+            if not amount:
+                raise RuntimeError("Cannot quote complete V3 path")
+        return self._floor(amount)
 
     def buy_v3_multihop(self, path_tokens, path_fees, amount_wei, recipient, min_out=1, gas=350000):
+        if min_out <= 1:
+            min_out = self._v3_floor(path_tokens, path_fees, amount_wei)
         path = encode_v3_path(path_tokens, path_fees)
         max_fee, prio = self._gas_fees()
         tx = self.sr02.functions.exactInput((
@@ -563,6 +619,12 @@ class StockV4Router:
         return self._send(tx)
 
     def buy_v4(self, hops, amount_wei, recipient, gas=650000):
+        hops = [dict(h) for h in hops]
+        for hop in hops:
+            if hop.get("min_out", 1) <= 1:
+                hop["min_out"] = self._floor(self.quote_v4(
+                    hop["token_in"], hop["token_out"], hop["amount_in"],
+                    hop["fee"], hop["tick"], hop["hook"]))
         first_in = hops[0]["token_in"]
         needs_wrap = (_cs(first_in).lower() == WETH.lower())
 
@@ -633,6 +695,8 @@ class StockV4Router:
             est_gas = self.w3.eth.estimate_gas(tx)
             if est_gas and est_gas > 0:
                 tx["gas"] = max(gas, int(est_gas * 1.2))
+        except (ExecutionUncertain, PreflightFailure):
+            raise
         except Exception as e:
             raise RuntimeError(f"Universal Router V4 pre-flight estimate_gas reverted: {e}")
 
@@ -643,6 +707,9 @@ class StockV4Router:
             path = path_or_token
         else:
             path = [WETH, path_or_token]
+        if min_out <= 1:
+            min_out = self._floor(self.v2_router.functions.getAmountsOut(
+                int(amount_wei), [_cs(p) for p in path]).call()[-1])
         max_fee, prio = self._gas_fees()
         tx = self.v2_router.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
             int(min_out),
@@ -661,66 +728,8 @@ class StockV4Router:
         return self._send(tx)
 
     def buy_quote_then_v4(self, token, quote, amount_wei, recipient, min_out=1):
-        """
-        One tx:
-          WRAP_ETH
-          V3 WETH -> USDG (fee 500)   [or WETH -> USDG -> STOCK if needed]
-          V4  USDG/STOCK -> token     [same 1-hop encode as BETA]
-        """
-        token = _cs(token)
-        quote = _cs(quote)
-
-        wrap = eth_abi.encode(["address", "uint256"], [UNIVERSAL_ROUTER, int(amount_wei)])
-
-        if quote.lower() == USDG.lower():
-            commands = bytes([WRAP_ETH, V3_SWAP_EXACT_IN, V4_SWAP])
-            v3 = encode_v3_exact_in(WETH, USDG, 500, UNIVERSAL_ROUTER, amount_wei, 1, False)
-            v4 = make_v4_swap_input(USDG, token, 0, min_out, 2500, 25, ZERO)
-            inputs = [wrap, v3, v4]
-        else:
-            # stock quote: WETH -> USDG (V3) -> STOCK (V3 if pool exists else skip) 
-            # then V4 STOCK -> token
-            stock = quote
-            commands = bytes([WRAP_ETH, V3_SWAP_EXACT_IN, V4_SWAP])
-            # first get USDG, then try V3 USDG->stock; if no V3 stock pool, this will revert
-            # safer 2-step for stock: V3 WETH->USDG only, second tx V4. For one-tx:
-            v3 = encode_v3_exact_in(WETH, USDG, 500, UNIVERSAL_ROUTER, amount_wei, 1, False)
-            # If a V3 USDG/stock pool exists, use 2-hop V3 path instead of V4 first hop
-            stock_fee = None
-            for f in V3_FEES:
-                if self._v3_pool(USDG, stock, f):
-                    stock_fee = f
-                    break
-            if stock_fee is not None:
-                commands = bytes([WRAP_ETH, V3_SWAP_EXACT_IN, V4_SWAP])
-                path = encode_v3_path([WETH, USDG, stock], [500, stock_fee])
-                v3 = eth_abi.encode(
-                    ["address", "uint256", "uint256", "bytes", "bool"],
-                    [UNIVERSAL_ROUTER, int(amount_wei), 1, path, False],
-                )
-                v4 = make_v4_swap_input(stock, token, 0, min_out, 2500, 25, ZERO)
-                inputs = [wrap, v3, v4]
-            else:
-                # no V3 stock pool — cannot 1-tx safely; do V3 WETH->USDG only
-                return self.buy_v3_multihop([WETH, USDG], [500], amount_wei, recipient, 1, 250000)
-
-        max_fee, prio = self._gas_fees()
-        tx = self.ur.functions.execute(
-            commands, inputs, int(time.time()) + 300
-        ).build_transaction({
-            "from": self.account.address,
-            "value": int(amount_wei),
-            "gas": 750000,
-            "maxFeePerGas": max_fee,
-            "maxPriorityFeePerGas": prio,
-            "nonce": self.w3.eth.get_transaction_count(self.account.address),
-            "chainId": CHAIN_ID,
-        })
-        try:
-            self.w3.eth.estimate_gas(tx)
-        except Exception as e:
-            raise RuntimeError(f"hybrid estimate revert: {e}")
-        return self._send(tx)
+        """The mixed V3/V4 atomic encoder is unverified on chain 4663."""
+        raise PreflightFailure("Atomic mixed V3/V4 route is unverified; use protected two-hop routing")
 
     def buy_stock_two_tx(self, token: str, stock: str, amount_eth: float, token_fee=0, token_tick=200, token_hook=None):
         token = _cs(token)
@@ -739,15 +748,10 @@ class StockV4Router:
         # stranded in the wallet. Retrying used to re-run leg 1 and buy the stock
         # AGAIN, doubling the ETH spent. If we are already holding some, use that
         # instead of buying more.
-        if stock_before > 0:
-            logger.warning(
-                f"Already holding {stock_before} of {stock} from an earlier attempt - "
-                f"reusing it instead of buying more ETH worth"
-            )
-            acquired = stock_before
-            tx1 = None
-        else:
-            acquired = None
+        # Existing stock belongs to the wallet, not this new signal. A failed
+        # operation is reconciled explicitly instead of sweeping earlier holdings.
+        acquired = None
+        tx1 = None
 
         if acquired is None:
             # --- tx1: ETH -> STOCK (1-hop, same as BETA) ---
@@ -776,7 +780,7 @@ class StockV4Router:
                     }], amount_wei, me, 500000)
 
         if acquired is None:
-            self.w3.eth.wait_for_transaction_receipt(tx1, timeout=60)
+            self._wait_receipt(tx1, timeout=60)
             # Only what THIS leg bought -- reading the whole balance would sweep
             # stock stranded by an earlier failed attempt into this trade too.
             acquired = _stock.functions.balanceOf(me).call() - stock_before
@@ -806,7 +810,7 @@ class StockV4Router:
                 "maxFeePerGas": max_fee, "maxPriorityFeePerGas": prio,
                 "nonce": self.w3.eth.get_transaction_count(me), "chainId": 4663,
             })
-            self.w3.eth.wait_for_transaction_receipt(self._send(atx), timeout=60)
+            self._wait_receipt(self._send(atx), timeout=60)
 
         # --- tx2: STOCK -> TOKEN (1-hop V4, value=0, real amount) ---
         tx2 = self.buy_v4_erc20_in(
@@ -834,7 +838,7 @@ class StockV4Router:
         # another position's proceeds -- into this one token.
         usdg_before = usdg.functions.balanceOf(me).call()
         tx1 = self.buy_v3_multihop([WETH, USDG], [500], amount_wei, me, 1, 280000)
-        self.w3.eth.wait_for_transaction_receipt(tx1, timeout=60)
+        self._wait_receipt(tx1, timeout=60)
         acquired = usdg.functions.balanceOf(me).call() - usdg_before
         if acquired <= 0:
             raise RuntimeError(f"tx1 filled no USDG: {tx1}")
@@ -865,9 +869,11 @@ class StockV4Router:
     def _erc20_bal(self, token):
         return self.w3.eth.contract(_cs(token), abi=ERC20_ABI).functions.balanceOf(self.account.address).call()
 
-    def sell_v3_path(self, path, fees, amount_in, min_out=1):
+    def sell_v3_path(self, path, fees, amount_in, min_out=1, simulate=False):
         me = self.account.address
         token_in = _cs(path[0])
+        if min_out <= 1:
+            min_out = self._v3_floor(path, fees, amount_in)
         erc = self.w3.eth.contract(token_in, abi=ERC20_ABI)
         max_fee, prio = self._gas_fees()
         if erc.functions.allowance(me, SWAP_ROUTER_02).call() < amount_in:
@@ -876,7 +882,7 @@ class StockV4Router:
                 "maxFeePerGas": max_fee, "maxPriorityFeePerGas": prio,
                 "nonce": self.w3.eth.get_transaction_count(me), "chainId": CHAIN_ID,
             })
-            self.w3.eth.wait_for_transaction_receipt(self._send(atx), timeout=60)
+            self._wait_receipt(self._send(atx), timeout=60)
         raw = bytes.fromhex(_cs(path[0])[2:])
         for fee, tok in zip(fees, path[1:]):
             raw += int(fee).to_bytes(3, "big") + bytes.fromhex(_cs(tok)[2:])
@@ -885,6 +891,8 @@ class StockV4Router:
             "maxFeePerGas": max_fee, "maxPriorityFeePerGas": prio,
             "nonce": self.w3.eth.get_transaction_count(me), "chainId": CHAIN_ID,
         })
+        if simulate:
+            tx["gas"] = max(tx["gas"], int(self.w3.eth.estimate_gas(tx) * 1.2))
         return self._send(tx)
 
     def sell_to_eth(self, token: str, amount_tokens: int, fee=0, tick=200, hook=None, quote=None,
@@ -916,6 +924,8 @@ class StockV4Router:
             })
             try:
                 tx["gas"] = max(500000, int(self.w3.eth.estimate_gas(tx) * 1.2))
+            except (ExecutionUncertain, PreflightFailure):
+                raise
             except Exception as e:
                 raise RuntimeError(f"V4 ETH sell estimate revert: {e}")
             return self._send(tx)
@@ -924,7 +934,7 @@ class StockV4Router:
         # any quote token the wallet already held into this sale.
         q_before = self._erc20_bal(quote)
         tx1 = self.buy_v4_erc20_in(token, quote, amount_tokens, 1, int(fee), int(tick) if tick > 0 else 200, hook)
-        self.w3.eth.wait_for_transaction_receipt(tx1, timeout=60)
+        self._wait_receipt(tx1, timeout=60)
         q_bal = self._erc20_bal(quote) - q_before
         if q_bal <= 0:
             raise RuntimeError(f"V4 sell hop filled no quote ({quote}): {tx1}")
@@ -961,7 +971,7 @@ class StockV4Router:
                 "maxFeePerGas": max_fee, "maxPriorityFeePerGas": prio,
                 "nonce": self.w3.eth.get_transaction_count(me), "chainId": CHAIN_ID,
             })
-            self.w3.eth.wait_for_transaction_receipt(self._send(tx), timeout=60)
+            self._wait_receipt(self._send(tx), timeout=60)
 
         amt, exp, _ = p2.functions.allowance(me, token, UNIVERSAL_ROUTER).call()
         now = int(time.time())
@@ -971,10 +981,12 @@ class StockV4Router:
                 "maxFeePerGas": max_fee, "maxPriorityFeePerGas": prio,
                 "nonce": self.w3.eth.get_transaction_count(me), "chainId": CHAIN_ID,
             })
-            self.w3.eth.wait_for_transaction_receipt(self._send(tx), timeout=60)
+            self._wait_receipt(self._send(tx), timeout=60)
 
     def buy_v4_erc20_in(self, token_in, token_out, amount_in, min_out, fee, tick, hook):
         token_in, token_out = _cs(token_in), _cs(token_out)
+        if min_out <= 1:
+            min_out = self._floor(self.quote_v4(token_in, token_out, amount_in, fee, tick, hook))
         self.ensure_permit2(token_in, amount_in)
 
         pull = eth_abi.encode(
@@ -982,8 +994,10 @@ class StockV4Router:
             [token_in, UNIVERSAL_ROUTER, int(amount_in)],
         )
         v4 = make_v4_swap_input(token_in, token_out, amount_in, min_out, fee, tick, hook)
-        commands = bytes([PERMIT2_TRANSFER_FROM, 0x10])  # pull + V4_SWAP
-        inputs = [pull, v4]
+        # SETTLE_ALL in make_v4_swap_input pulls the input through Permit2.
+        # An additional transfer command pulled it twice and reverted leg two.
+        commands = bytes([0x10])
+        inputs = [v4]
 
         max_fee, prio = self._gas_fees()
         tx = self.ur.functions.execute(commands, inputs, int(time.time()) + 300).build_transaction({
@@ -1029,8 +1043,8 @@ class StockV4Router:
             ["address", "uint256"],
             [self.account.address, int(min_out_wei)],
         )
-        commands = bytes([0x02, 0x10, UNWRAP_WETH])
-        inputs = [pull, v4, unwrap]
+        commands = bytes([0x10, UNWRAP_WETH])
+        inputs = [v4, unwrap]
 
         max_fee, prio = self._gas_fees()
         tx = self.ur.functions.execute(commands, inputs, int(time.time()) + 300).build_transaction({
@@ -1082,7 +1096,9 @@ class StockV4Router:
 
         # V4 USDG quote: 1-tx ETH -> USDG (V3) -> TOKEN (V4)
         if q == USDG.lower():
-            return self.buy_quote_then_v4(token, USDG, amount_wei, recipient, min_out)
+            # The atomic mixed-version encoder is known to revert on this chain.
+            return self.buy_usdg_two_tx(token, amount_eth, fee, tick, hook,
+                lambda amount: self._floor(self.quote_v4(USDG, token, amount, fee, tick, hook)))
 
         # V4 Stock / ERC20 quote: 2-tx ETH -> STOCK then STOCK -> TOKEN
         if _cs(quote) in STOCK_LIST or q not in (NATIVE.lower(), WETH.lower(), ZERO.lower(), USDG.lower()):

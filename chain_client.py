@@ -1,11 +1,12 @@
 import asyncio
-import asyncio
 import logging
+import math
 import time
 from typing import Dict, Any, Optional, List
 import aiohttp
 from web3 import Web3
 from web3.exceptions import TransactionNotFound
+from execution_guard import ExecutionUncertain
 
 logger = logging.getLogger("copytrader")
 
@@ -95,6 +96,7 @@ class ChainClient:
         self._eth_price_usd: Optional[float] = None
         self._eth_price_timestamp: float = 0
         self._price_cache_ttl = 60
+        self._decimals_cache = {}
 
     def _connect(self, url: str):
         return Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 10}))
@@ -120,7 +122,9 @@ class ChainClient:
         self._rpc_index = (self._rpc_index + 1) % len(self.rpc_pool)
         url = self.rpc_pool[self._rpc_index]
         logger.warning(f"Rotating RPC -> {url}")
-        self.w3 = self._connect(url)
+        # Preserve the Web3 object used by existing contracts and bound callables.
+        # Replacing it left retry callbacks attached to the failed provider.
+        self.w3.provider = self._connect(url).provider
         self.fallback_rpc = url
         self.fallback_w3 = self.w3
 
@@ -198,15 +202,17 @@ class ChainClient:
                     async with session.get(url) as resp:
                         if resp.status == 200:
                             price = parser(await resp.json())
+                            if not math.isfinite(price) or price <= 0:
+                                continue
                             self._eth_price_usd = price
                             self._eth_price_timestamp = now
                             return price
             except Exception:
                 pass
 
-        if self._eth_price_usd:
+        if self._eth_price_usd and now - self._eth_price_timestamp <= 300:
             return self._eth_price_usd
-        return 2500.0
+        raise RuntimeError("No fresh ETH/USD price available; cannot size an entry")
 
     async def usd_to_eth(self, usd_amount: float) -> float:
         price = await self.get_eth_price_usd()
@@ -233,12 +239,11 @@ class ChainClient:
         if not self.account:
             raise ValueError("No private key configured")
 
-        if "nonce" not in tx:
-            tx["nonce"] = await self.get_nonce()
+        tx["nonce"] = await self.get_nonce()
         if "gas" not in tx:
             tx["gas"] = await self.estimate_gas(tx)
         if "chainId" not in tx:
-            tx["chainId"] = 4663
+            tx["chainId"] = self.chain_id
 
         # Re-price here, ALWAYS, overwriting whatever the caller set. This block used
         # to be skipped whenever maxFeePerGas was already present -- which every
@@ -256,8 +261,15 @@ class ChainClient:
 
         signed_tx = self.w3.eth.account.sign_transaction(tx, private_key=self.account.key)
         raw_tx_bytes = getattr(signed_tx, "raw_transaction", getattr(signed_tx, "rawTransaction", None))
-        tx_hash = await self._retry(self.w3.eth.send_raw_transaction, raw_tx_bytes)
-        hash_hex = self.w3.to_hex(tx_hash)
+        hash_hex = self.w3.to_hex(self.w3.keccak(raw_tx_bytes))
+        guard = getattr(self, "execution_guard", None)
+        if guard:
+            guard.before_send(hash_hex, tx)
+        try:
+            await self._run_in_thread(self.w3.eth.send_raw_transaction, raw_tx_bytes)
+        except Exception as exc:
+            if "already known" not in str(exc).lower():
+                raise ExecutionUncertain(f"broadcast outcome unknown: {hash_hex}") from exc
         logger.info(f"Transaction sent: {hash_hex}")
         return hash_hex
 
@@ -269,18 +281,27 @@ class ChainClient:
             try:
                 receipt = await self._run_in_thread(self.w3.eth.get_transaction_receipt, tx_hash)
                 if receipt:
+                    guard = getattr(self, "execution_guard", None)
+                    if guard:
+                        guard.receipt(tx_hash, receipt)
                     return receipt
             except TransactionNotFound:
                 pass
             except Exception as e:
                 logger.warning(f"Error waiting for receipt: {e}")
             await asyncio.sleep(2)
-        raise TimeoutError(f"Transaction {tx_hash} receipt not found after {timeout} seconds")
+        raise ExecutionUncertain(f"Transaction {tx_hash} receipt not found after {timeout} seconds")
 
     async def get_token_decimals(self, token_address: str) -> int:
         token_address = self.w3.to_checksum_address(token_address)
+        if token_address in self._decimals_cache:
+            return self._decimals_cache[token_address]
         contract = self.w3.eth.contract(address=token_address, abi=ERC20_ABI)
-        return await self._retry(contract.functions.decimals().call)
+        decimals = int(await self._retry(contract.functions.decimals().call))
+        if not 0 <= decimals <= 255:
+            raise ValueError("Invalid ERC20 decimals")
+        self._decimals_cache[token_address] = decimals
+        return decimals
 
     async def approve_token(self, token_address: str, spender: str, amount: int) -> str:
         token_address = self.w3.to_checksum_address(token_address)

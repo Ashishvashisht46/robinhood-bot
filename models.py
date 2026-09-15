@@ -67,6 +67,14 @@ class Position:
     tx_hash_sell: Optional[str] = None
     pnl_usd: Optional[float] = None
     pnl_pct: Optional[float] = None
+    signal_message_id: Optional[int] = None
+    buy_operation_id: Optional[str] = None
+    gas_cost_usd: float = 0.0
+    pnl_basis: str = "mark_estimate"
+    cash_measurement_complete: bool = False
+    entry_funding: Optional[dict] = None
+    pending_exit: Optional[dict] = None
+    completed_sell_operations: List[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """

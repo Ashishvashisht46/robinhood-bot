@@ -44,6 +44,15 @@ def _sink() -> logging.Logger:
     return _log
 
 
+def configure_ledger(path):
+    """Route paper events to their own ledger before starting any component."""
+    global LEDGER_PATH
+    for handler in list(_log.handlers):
+        handler.close()
+        _log.removeHandler(handler)
+    LEDGER_PATH = str(path)
+
+
 def log_event(kind: str, **fields) -> None:
     """
     Append one event as a single JSON line.

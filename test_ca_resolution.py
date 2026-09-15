@@ -90,7 +90,7 @@ def main():
 
         # A clone with the same ticker must not win on ordering alone.
         stub([pair("ROACH", CLONE, 50), pair("ROACH", REAL, 14000)])
-        check("most liquid of several same-ticker tokens", resolve(), REAL)
+        check("ambiguous same-ticker tokens rejected", resolve(), None)
 
         # The dangerous old behaviour: no symbol match, so it fell back to "any
         # robinhood pair" and bought a completely different token.
@@ -123,7 +123,7 @@ def main():
         # token or a DexScreener pool address.
         btns = [[FakeBtn("DexS", "https://dexscreener.com/robinhood/" + OTHER),
                  FakeBtn("GMGN", "https://gmgn.ai/robinhood/token/" + REAL)]]
-        check("first button wins -- order matters", resolve(allow=False, buttons=btns), OTHER)
+        check("token link outranks chart pool regardless of order", resolve(allow=False, buttons=btns), REAL)
 
         print("")
         print("Telethon populates message.buttons from an entity cache and returns")

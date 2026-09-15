@@ -18,6 +18,7 @@ the OLDEST file. Reading them in glob order interleaves history at random.
 """
 import glob
 import json
+import math
 import os
 import re
 import subprocess
@@ -37,6 +38,10 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 # Each entry: kind -> pattern. Groups are named so the record is self-describing.
 PATTERNS = {
+    "startup": re.compile(r"Config loaded from .+ \| DRY_RUN=(?P<paper>True|False) \|"),
+    "heartbeat": re.compile(r"Telegram connection heartbeat ping OK"),
+    "listener_active": re.compile(r"Telegram listener active"),
+    "wallet_balance": re.compile(r"Wallet Balance: (?P<eth>[\d.]+) ETH \(\$(?P<usd>[\d.]+) USD\)"),
     "signal": re.compile(r"==> Incoming Signal: \$(?P<ticker>\S+) \(DEX: (?P<dex>[^)]*)\)"),
     "skip_no_ca": re.compile(r"Skipping \$(?P<ticker>\S+): No contract address identified\."),
     "skip": re.compile(r"Skipping trade for \$(?P<ticker>[^:]+): (?P<reason>.+)"),
@@ -140,6 +145,26 @@ def _num(value, default=0.0):
         return default
 
 
+def _match_ledger(pool: list, rec: dict):
+    """
+    Find the ledger row for THIS close, and consume it so it cannot be reused.
+
+    Matching on ticker + day alone reused a single event for every close of that
+    ticker that day. OPENFANG traded twice on 2026-09-14 and both rows rendered
+    with the first close's time and P&L, so the listed trades summed to -$3.26
+    against a counter total of -$2.71. The counters were right; the trade list
+    was quietly wrong, which is the worse direction.
+    """
+    for i, ev in enumerate(pool):
+        if (ev.get("closed_at") == rec["time"]
+                and ev.get("closed_day", rec["day"]) == rec["day"]):
+            return pool.pop(i)
+    for i, ev in enumerate(pool):
+        if str(ev.get("ts", "")).startswith(rec["day"]):
+            return pool.pop(i)
+    return None
+
+
 def build_trades(records: list, events: list) -> list:
     """
     Correlate a trade's life: buy attempt -> swap -> open -> tranche exits -> close.
@@ -189,12 +214,11 @@ def build_trades(records: list, events: list) -> list:
             t.update(outcome="closed", closed_at=rec["time"], closed_day=rec["day"],
                      is_win=rec.get("win") == "True", pnl_usd=_num(rec.get("pnl")),
                      balance_after=_num(rec.get("balance")))
-            # Upgrade with the ledger row if this close was recorded properly.
-            for ev in ledger_closed.get(ticker, []):
-                if ev.get("ts", "").startswith(rec["day"]):
-                    t.update({k: v for k, v in ev.items() if k not in ("kind", "ts")})
-                    t["source"] = "ledger"
-                    break
+            ev = _match_ledger(ledger_closed.get(ticker, []), rec)
+            if ev:
+                t.update({k: v for k, v in ev.items() if k not in ("kind", "ts", "source")})
+                # A backfilled row is still reconstructed, however it reached us.
+                t["source"] = ev.get("source") or "ledger"
             trades.append(t)
 
     trades.extend(open_attempts.values())  # still open, or never resolved
@@ -234,15 +258,93 @@ def bot_process() -> dict:
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
+             "$ErrorActionPreference = 'Stop'\n"
              "@(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
              "Where-Object { $_.CommandLine -like '*main.py*' -and "
              "($_.ExecutablePath -like '*robinhood-bot*' -or "
              "$_.CommandLine -like '*robinhood-bot*') }).Count"],
             capture_output=True, text=True, timeout=30)
+        if out.returncode != 0 or not (out.stdout or "").strip().isdigit():
+            return {"running": None, "error": "Process status unavailable"}
         return {"running": int((out.stdout or "0").strip() or 0) > 0,
                 "processes": int((out.stdout or "0").strip() or 0)}
     except Exception as exc:
-        return {"running": None, "error": str(exc)}
+        return {"running": None, "error": type(exc).__name__}
+
+
+def risk_limits() -> dict:
+    """Read only non-secret configuration used in the entry budget calculation."""
+    defaults = dict(SAFETY_FLOOR_USD="40", BASELINE_STAKE_USD="2",
+                    COMPOUND_STAKE_USD="5", GAS_RESERVE_USD="0.25",
+                    BUFFER_GATE_USD="60", ENABLE_COMPOUNDING="false")
+    values = {k: os.environ.get(k, v) for k, v in defaults.items()}
+    try:
+        from dotenv import dotenv_values
+        configured = dotenv_values(os.path.join(HERE, ".env"))
+        values.update({k: configured[k] for k in defaults if configured.get(k) is not None})
+    except OSError:
+        pass
+    return values
+
+
+def entry_budget(state, limits=None) -> dict:
+    """Diagnostic only: never changes the balance, stake or trading settings."""
+    values = risk_limits() if limits is None else limits
+    try:
+        balance = float(state["balance_usd"])
+        floor = float(values["SAFETY_FLOOR_USD"])
+        gas = float(values["GAS_RESERVE_USD"])
+        baseline = float(values["BASELINE_STAKE_USD"])
+        compound = float(values["COMPOUND_STAKE_USD"])
+        buffer = float(values["BUFFER_GATE_USD"])
+        stakes = [float(p["stake_usd"]) for p in state.get("open_positions", [])]
+        numbers = [balance, floor, gas, baseline, compound, buffer] + stakes
+        if state.get("error") or any(not math.isfinite(n) or n < 0 for n in numbers):
+            raise ValueError("invalid state or limits")
+        use_compound = (str(values["ENABLE_COMPOUNDING"]).lower() == "true"
+                        and str(state.get("state", "BASELINE")).upper() == "COMPOUND"
+                        and not (buffer > 0 and balance < buffer))
+        stake = compound if use_compound else baseline
+        reserved = sum(stakes)
+        required = floor + gas + stake + reserved
+        return dict(known=True, balance_usd=balance, safety_floor_usd=floor,
+                    gas_reserve_usd=gas, next_stake_usd=stake, reserved_stake_usd=reserved,
+                    required_balance_usd=required, shortfall_usd=max(0, required - balance),
+                    below_requirement=balance < required,
+                    halted=str(state.get("state", "")).upper() == "HALTED")
+    except (KeyError, TypeError, ValueError):
+        return dict(known=False)
+
+
+def activity_summary(records):
+    started = next((i for i in range(len(records)-1, -1, -1)
+                    if records[i]["kind"] == "startup"), None)
+    session = records[started:] if started is not None else []
+    stamp = lambda row: f"{row['day']} {row['time']}" if row else None
+    floor_refusals = [r for r in records if r["kind"] == "skip"
+                      and "balance above floor" in r.get("reason", "").lower()]
+    wallet = next((r for r in reversed(records) if r["kind"] == "wallet_balance"), None)
+    return dict(started_at=stamp(records[started]) if started is not None else None,
+                last_activity_at=stamp(records[-1]) if records else None,
+                session_signal_evaluations=sum(r["kind"] == "signal" for r in session),
+                session_floor_refusals=sum(r["kind"] == "skip" and
+                    "balance above floor" in r.get("reason", "").lower() for r in session),
+                last_floor_refusal_at=stamp(floor_refusals[-1]) if floor_refusals else None,
+                native_wallet_usd=_num(wallet["usd"]) if wallet else None,
+                native_wallet_at=stamp(wallet))
+
+
+def source_stamp():
+    """Invalidate parsed data on state, ledger or config changes as well as logs."""
+    paths = log_files() + [STATE, os.path.join(LOGS, "events.jsonl"), os.path.join(HERE, ".env")]
+    result = []
+    for path in paths:
+        try:
+            stat = os.stat(path)
+            result.append((path, stat.st_mtime_ns, stat.st_size))
+        except OSError:
+            result.append((path, None, None))
+    return tuple(result)
 
 
 def collect(check_process: bool = True) -> dict:
@@ -274,6 +376,8 @@ def collect(check_process: bool = True) -> dict:
         "code_version": next((r["mtime"] for r in reversed(records)
                               if r["kind"] == "code_version"), None),
         "totals": state,
+        "entry_budget": entry_budget(state),
+        "activity": activity_summary(records),
         "days": day_counters(records),
         "trades": trades,
         "open_positions": [
@@ -293,19 +397,12 @@ def collect(check_process: bool = True) -> dict:
         "no_ca_dumps": [r for r in records if r["kind"] == "no_ca_dump"],
         "ledger_events": len(events),
         # So the page can say WHY trading stopped, not just that it did.
-        "safety_floor": _num(os.environ.get("SAFETY_FLOOR_USD"), 0.0) or _env_floor(),
+        "safety_floor": _num(risk_limits()["SAFETY_FLOOR_USD"]),
     }
 
 
 def _env_floor() -> float:
-    """SAFETY_FLOOR_USD from .env, without importing config (which builds a chain client)."""
-    try:
-        for line in open(os.path.join(HERE, ".env"), encoding="utf-8"):
-            if line.strip().startswith("SAFETY_FLOOR_USD"):
-                return _num(line.split("=", 1)[1])
-    except OSError:
-        pass
-    return 0.0
+    return _num(risk_limits()["SAFETY_FLOOR_USD"])
 
 
 def backfill() -> int:

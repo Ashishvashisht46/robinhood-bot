@@ -2,11 +2,12 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 
-def setup_logging():
+def setup_logging(log_dir=None):
     logger = logging.getLogger("copytrader")
     logger.setLevel(logging.DEBUG)
 
-    os.makedirs("logs", exist_ok=True)
+    log_dir = log_dir or os.path.join(os.path.dirname(__file__), "logs")
+    os.makedirs(log_dir, exist_ok=True)
 
     import sys
     if hasattr(sys.stdout, 'reconfigure'):
@@ -43,7 +44,7 @@ def setup_logging():
 
     # File Handler (DEBUG)
     file_handler = RotatingFileHandler(
-        "logs/bot.log", maxBytes=5*1024*1024, backupCount=5, encoding="utf-8"
+        os.path.join(log_dir, "bot.log"), maxBytes=5*1024*1024, backupCount=5, encoding="utf-8"
     )
     file_handler.setLevel(logging.DEBUG)
     file_formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")

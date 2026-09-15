@@ -1,4 +1,5 @@
 import os
+import math
 from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
@@ -68,13 +69,26 @@ class Config:
         self.GAS_MULTIPLIER: float = float(os.getenv("GAS_MULTIPLIER", "1.3"))
         self.FAST_EXECUTION_MODE: bool = str(os.getenv("FAST_EXECUTION_MODE", "true")).lower() == "true"
         self.BUY_EVERY_SIGNAL: bool = str(os.getenv("BUY_EVERY_SIGNAL", "true")).lower() == "true"
+        self.MAX_SIGNAL_AGE_SECONDS = int(os.getenv("MAX_SIGNAL_AGE_SECONDS", "120"))
+        self.MAX_SIGNAL_ATTEMPTS = int(os.getenv("MAX_SIGNAL_ATTEMPTS", "6"))
+        self.SIGNAL_RETRY_SECONDS = float(os.getenv("SIGNAL_RETRY_SECONDS", "5"))
+        self.SIGNAL_BACKFILL_LIMIT = int(os.getenv("SIGNAL_BACKFILL_LIMIT", "100"))
+        self.GAS_RESERVE_USD = float(os.getenv("GAS_RESERVE_USD", "0.25"))
+        self.MAX_DAILY_LOSS_USD = float(os.getenv("MAX_DAILY_LOSS_USD", "0"))
+        self.MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "0"))
+        self.ENABLE_COMPOUNDING = os.getenv("ENABLE_COMPOUNDING", "false").lower() == "true"
+        self.PAPER_FEE_PER_SWAP_USD = float(os.getenv("PAPER_FEE_PER_SWAP_USD", "0.03"))
+        self.PAPER_SLIPPAGE_PCT = float(os.getenv("PAPER_SLIPPAGE_PCT", "2"))
+        self.RPC_SCAN_WORKERS = int(os.getenv("RPC_SCAN_WORKERS", "4"))
+        self.REUSE_STOCK_INVENTORY = os.getenv("REUSE_STOCK_INVENTORY", "true").lower() == "true"
         # Resolving a contract address from the TICKER is unsafe on this chain:
         # a live search for "ROACH" returns 6 different tokens, and the most
         # liquid one is not the one that was called. Anyone can mint a clone of
         # a ticker, which is exactly how a honeypot gets bought. Off by default;
         # the contract address should come from the call message's buttons.
         # Tokens held deliberately (e.g. USDG kept as swap liquidity). status.py
-        # will not flag these as stranded. Comma-separated addresses.
+        # will not flag these as stranded. Also excluded from automatic stock
+        # funding. Comma-separated addresses.
         self.RESERVED_TOKENS: set = {
             a.strip().lower() for a in os.getenv("RESERVED_TOKENS", "").split(",") if a.strip()
         }
@@ -83,6 +97,7 @@ class Config:
         self.ENV_PATH = str(_ENV_PATH)
 
     def validate(self):
+        self.validate_risk()
         if not self.TELEGRAM_API_ID:
             raise ValueError("TELEGRAM_API_ID is required")
         if not self.TELEGRAM_API_HASH:
@@ -94,5 +109,27 @@ class Config:
                 raise ValueError("PRIVATE_KEY must start with 0x")
             if len(self.PRIVATE_KEY) != 66:
                 raise ValueError("PRIVATE_KEY format is invalid, must be 66 characters long starting with 0x")
+
+    def validate_risk(self):
+        positive = ("INITIAL_CAPITAL_USD", "BASELINE_STAKE_USD", "COMPOUND_STAKE_USD",
+                    "MAX_CONCURRENT_POSITIONS", "PRICE_POLL_SECONDS", "MAX_SIGNAL_AGE_SECONDS",
+                    "MAX_SIGNAL_ATTEMPTS", "SIGNAL_RETRY_SECONDS", "SIGNAL_BACKFILL_LIMIT",
+                    "STAGNANT_TIMEOUT_MINUTES", "RUNNER_TIMEOUT_MINUTES", "TRAILING_STOP_DELTA", "RPC_SCAN_WORKERS")
+        for name in positive:
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        for name in ("SAFETY_FLOOR_USD", "GAS_RESERVE_USD", "MAX_DAILY_LOSS_USD", "MAX_CONSECUTIVE_LOSSES",
+                     "MAX_BUY_TAX", "MAX_SELL_TAX", "MIN_LIQUIDITY_USD", "MIN_HOLDERS", "PAPER_FEE_PER_SWAP_USD"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+        if not 0 <= self.SLIPPAGE_PCT < 100:
+            raise ValueError("SLIPPAGE_PCT must be in [0, 100)")
+        if not 0 <= self.PAPER_SLIPPAGE_PCT < 100:
+            raise ValueError("PAPER_SLIPPAGE_PCT must be in [0, 100)")
+        if not 0 < self.SL_MULTIPLIER < 1 < self.TP1_MULTIPLIER < self.TP2_MULTIPLIER < self.TP3_MULTIPLIER:
+            raise ValueError("Expected 0 < SL < 1 < TP1 < TP2 < TP3")
+        if not 0 < self.TP1_RATIO < 1 or not 0 < self.TP2_RATIO < 1 or self.TP1_RATIO + self.TP2_RATIO >= 1:
+            raise ValueError("TP ratios must be positive and sum to less than 1")
 
 config = Config()

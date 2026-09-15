@@ -31,3 +31,6 @@ dashboard_artifact.html
 # repo -- it hardcodes local paths and is specific to the fork arrangement.
 sync_public.py
 push_both.bat
+
+# Local audit includes private trading results.
+AUDIT_REPORT.md

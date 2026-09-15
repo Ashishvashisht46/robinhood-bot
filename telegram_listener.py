@@ -8,6 +8,9 @@ from telethon import TelegramClient, events, errors
 from config import Config
 from message_parser import MessageParser
 from models import CallSignal
+from trade_ledger import log_event
+from types import SimpleNamespace
+from datetime import datetime, timezone
 
 logger = logging.getLogger("copytrader")
 
@@ -30,6 +33,7 @@ class TelegramListener:
                 await asyncio.sleep(45)
                 if self.client and self.client.is_connected():
                     await self.client.get_me()
+                    await self.client.catch_up()
                     logger.debug("Telegram connection heartbeat ping OK.")
             except (asyncio.CancelledError, GeneratorExit):
                 break
@@ -78,11 +82,16 @@ class TelegramListener:
                         self._handle_new_message, 
                         events.NewMessage(chats=[channel])
                     )
+                    self.client.add_event_handler(
+                        self._handle_new_message, events.MessageEdited(chats=[channel]))
                     self._handler_registered = True
+                    await self.client.catch_up()
+                    await self._backfill_recent(channel)
                     self._lock_strikes = 0
                     logger.info("Telegram listener active. Listening for EARLY CALL alerts...")
 
                 await self.client.run_until_disconnected()
+                self._handler_registered = False
                 
             except errors.FloodWaitError as e:
                 self._handler_registered = False
@@ -129,6 +138,17 @@ class TelegramListener:
                         pass
                     await asyncio.sleep(3)
 
+    async def _backfill_recent(self, channel):
+        """Recover a bounded recent window; the durable queue deduplicates overlap."""
+        async for message in self.client.iter_messages(
+                channel, limit=self.config.SIGNAL_BACKFILL_LIMIT):
+            stamp = message.date
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - stamp).total_seconds() > self.config.MAX_SIGNAL_AGE_SECONDS:
+                break
+            await self._handle_new_message(SimpleNamespace(message=message))
+
     async def stop(self):
         """Gracefully stops the Telegram listener."""
         self.is_running = False
@@ -143,6 +163,9 @@ class TelegramListener:
         """Internal handler for new messages."""
         try:
             text = event.message.message
+            log_event("message_received", message_id=event.message.id,
+                      channel=self.config.CHANNEL_USERNAME,
+                      edited=bool(getattr(event.message, "edit_date", None)))
             message_id = event.message.id
             timestamp = event.message.date
             entities = event.message.entities
@@ -189,6 +212,9 @@ class TelegramListener:
                 reply_markup,
             )
             
+            if not signal:
+                log_event("message_ignored", message_id=message_id,
+                          reason="not a recognized call or unparseable header")
             if signal:
                 logger.info(f"Valid CallSignal extracted for {signal.ticker}.")
                 # Call the async callback

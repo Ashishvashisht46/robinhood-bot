@@ -1,5 +1,24 @@
 # Robinhood Chain sniper bot + activity dashboard
 
+## Reliability upgrade
+
+Start with [UPGRADE_GUIDE.md](UPGRADE_GUIDE.md) for the durable signal inbox,
+transaction reconciliation, partial-exit recovery, risk limits, isolated paper
+mode, and P&L measurement changes. [UPGRADE_PLAN.md](UPGRADE_PLAN.md) records the
+implementation plan and initial findings.
+
+```powershell
+.\.venv\Scripts\python.exe -B run_offline_tests.py
+.\.venv\Scripts\python.exe main.py --paper
+.\.venv\Scripts\python.exe strategy_report.py --output AUDIT_REPORT.md
+```
+
+No live settings were enabled by the upgrade. Historical observations do not
+establish a profitable strategy; see the report's cost assumptions and limitations.
+Descriptions below of earlier live route verification refer to the prior version,
+not validation of this upgrade against a funded wallet.
+
+
 An automated sniper for **Robinhood Chain (ID 4663)**. It watches a Telegram call
 channel, resolves the token's contract address, routes a buy across whichever DEX
 venue actually has liquidity, and manages the exit with a 40/40/20 ladder.
@@ -32,8 +51,9 @@ not inferred from reading the code.
 
 Known-imperfect and documented rather than hidden:
 
-- **Dashboard P&L is gross.** Only the pre-flight gas estimate is logged, not actual
-  gas used, so fees are not deducted.
+- **Legacy dashboard P&L is estimated and gross.** New entries carry a P&L
+  measurement type and measured receipt gas where available; the existing
+  dashboard may combine measurement types. Use the audit report to distinguish them.
 - **Calls sometimes arrive with no contract address.** Those are skipped rather than
   guessed — see `ALLOW_TICKER_FALLBACK` in `.env.example` for why guessing is unsafe.
 - **Entry latency is bound by your RPC.** Free endpoints rate-limit under load and a

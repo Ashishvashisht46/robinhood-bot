@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Optional, List, Any
 
 from models import CallSignal
+from contract_resolution import extract_contract
 
 logger = logging.getLogger("copytrader")
 
@@ -13,7 +14,7 @@ class MessageParser:
     def __init__(self, allow_ticker_fallback: bool = False):
         # Universal ticker pattern matching "$TICKER · robinhood" with any prefix (EARLY CALL, NARRATIVE, etc.)
         self.ticker_pattern = re.compile(
-            r"\$([A-Za-z0-9_\u4e00-\u9fff\U00010000-\U0010ffff]+)\s*·\s*robinhood", 
+            r"\$([A-Za-z0-9_\u4e00-\u9fff\U00010000-\U0010ffff]+)\s*[·.|]\s*robinhood",
             re.IGNORECASE
         )
         self.fallback_ticker_pattern = re.compile(
@@ -70,80 +71,11 @@ class MessageParser:
                 return None
             ticker = ticker_match.group(1).upper()
 
-            # 2. Extract address
-            contract_address = None
-            
-            # Check inline buttons (telethon message.buttons or message.reply_markup)
-            if buttons:
-                for row in buttons:
-                    if isinstance(row, list):
-                        for btn in row:
-                            url = getattr(btn, 'url', None) or getattr(btn, 'data', None)
-                            if url and isinstance(url, str):
-                                url_match = self.address_pattern.search(url)
-                                if url_match:
-                                    contract_address = url_match.group(0)
-                                    break
-                    elif hasattr(row, 'url') and row.url:
-                        url_match = self.address_pattern.search(row.url)
-                        if url_match:
-                            contract_address = url_match.group(0)
-                            break
-                    if contract_address:
-                        break
+            # Resolve token identity before considering chart pools or ticker searches.
+            contract_address, address_source = extract_contract(
+                text, entities, buttons, reply_markup, ticker)
+            logger.debug("Msg %s address source: %s", message_id, address_source)
 
-            # Check reply_markup rows if not found yet
-            if not contract_address and reply_markup and hasattr(reply_markup, 'rows'):
-                # `rows`/`buttons` can be present but None (observed to raise
-                # TypeError, which the outer handler swallowed as a parse failure --
-                # losing the entities and text fallbacks below).
-                for row in (reply_markup.rows or []):
-                    if hasattr(row, 'buttons'):
-                        for btn in (row.buttons or []):
-                            url = getattr(btn, 'url', None)
-                            if url:
-                                url_match = self.address_pattern.search(url)
-                                if url_match:
-                                    contract_address = url_match.group(0)
-                                    break
-                    if contract_address:
-                        break
-
-            # Check entities
-            if not contract_address and entities:
-                for entity in entities:
-                    url = getattr(entity, 'url', None)
-                    if url:
-                        url_match = self.address_pattern.search(url)
-                        if url_match:
-                            contract_address = url_match.group(0)
-                            break
-            
-            # Check raw text with multiple address handling
-            if not contract_address:
-                # Priority 1: Check for explicit "CA:" / "Contract:" / "Token:" tag
-                ca_tag_match = re.search(r"(?:ca|contract|token|address)\s*[:=]?\s*(0x[a-fA-F0-9]{40})", text, re.IGNORECASE)
-                if ca_tag_match:
-                    contract_address = ca_tag_match.group(1)
-                    logger.info(f"Msg {message_id}: Extracted CA-tagged contract address: {contract_address}")
-                else:
-                    all_addrs = self.address_pattern.findall(text)
-                    if all_addrs:
-                        # Exclude known system contract addresses (WETH, USDG, Routers)
-                        system_addrs = {
-                            "0x0bd7d308f8e1639fab988df18a8011f41eacad73", # WETH
-                            "0x5fc5360d0400a0fd4f2af552add042d716f1d168", # USDG
-                            "0x8876789976decbfcbbbe364623c63652db8c0904", # Universal Router
-                            "0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e", # Pons V2 Factory
-                        }
-                        candidate_addrs = [a for a in all_addrs if a.lower() not in system_addrs]
-                        if candidate_addrs:
-                            contract_address = candidate_addrs[0]
-                            if len(candidate_addrs) > 1:
-                                logger.info(f"Msg {message_id}: Multiple 0x addresses found ({len(candidate_addrs)}). Selected candidate: {contract_address}")
-                        else:
-                            contract_address = all_addrs[0]
-            
             # DexScreener fallback: the channel often posts no CA at all, so resolve
             # it from the ticker. Two things matter here and both used to be wrong:
             #
@@ -188,7 +120,7 @@ class MessageParser:
                     f" lookup is disabled (ALLOW_TICKER_FALLBACK=false) because this"
                     f" chain has multiple tokens per ticker. Skipping this call."
                 )
-            if not contract_address and self.allow_ticker_fallback:
+            if not contract_address and self.allow_ticker_fallback and address_source == "missing":
                 try:
                     import urllib.request
                     import json
@@ -211,7 +143,7 @@ class MessageParser:
                         liq = float(((p.get('liquidity') or {}).get('usd') or 0))
                         candidates.append((liq, addr))
 
-                    if candidates:
+                    if len({a.lower() for _, a in candidates}) == 1:
                         candidates.sort(reverse=True)
                         liq, contract_address = candidates[0]
                         logger.info(

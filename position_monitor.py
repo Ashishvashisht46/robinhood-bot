@@ -1,8 +1,11 @@
 import asyncio
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Dict, Any, Callable, Optional
+
 from models import Position, PositionStatus
+from execution_guard import ExecutionUncertain
 from trade_ledger import log_event
 
 logger = logging.getLogger("copytrader")
@@ -11,257 +14,232 @@ logger = logging.getLogger("copytrader")
 class PositionMonitor:
     def __init__(self, config, dex_trader, chain_client, on_position_closed: Callable[[Position, bool], Any],
                  on_position_changed: Optional[Callable[[Position], Any]] = None):
-        self.config = config
-        self.dex_trader = dex_trader
-        self.chain_client = chain_client
-        self.on_position_closed = on_position_closed
-        # Called after a partial fill so the change reaches disk. Without it a
-        # restart after TP1 would reload the position as untouched and sell that
-        # 40% a second time.
-        self.on_position_changed = on_position_changed
+        self.config, self.dex_trader, self.chain_client = config, dex_trader, chain_client
+        self.on_position_closed, self.on_position_changed = on_position_closed, on_position_changed
         self._tasks: Dict[str, asyncio.Task] = {}
+        self._stopping = False
 
-    def _persist(self, position: Position) -> None:
-        if not self.on_position_changed:
-            return
-        try:
+    def _persist(self, position):
+        if self.on_position_changed:
             self.on_position_changed(position)
-        except Exception as e:
-            logger.error(f"Could not persist position {position.id}: {e}")
 
-    async def start_monitoring(self, position: Position):
-        if position.id in self._tasks:
-            return
-        self._tasks[position.id] = asyncio.create_task(self._monitor(position))
+    async def start_monitoring(self, position):
+        if position.id not in self._tasks or self._tasks[position.id].done():
+            self._tasks[position.id] = asyncio.create_task(self._monitor(position))
 
-    async def stop_monitoring(self, position_id: str):
-        if position_id in self._tasks:
-            self._tasks[position_id].cancel()
-            del self._tasks[position_id]
+    async def stop_monitoring(self, position_id):
+        task = self._tasks.get(position_id)
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def stop_all(self):
-        for task in self._tasks.values():
-            task.cancel()
+        self._stopping = True
+        # Let any in-flight signing/receipt operation finish. Cancelling a
+        # to_thread await does not stop its underlying signing thread.
+        await asyncio.gather(*list(self._tasks.values()), return_exceptions=True)
         self._tasks.clear()
 
-    async def _sell_or_retry(self, position: Position, tokens: float, slippage: float, tag: str) -> float:
-        if tokens <= 0:
-            return 0.0
-        last_err = None
-        for attempt in range(2):
-            try:
-                tx, sold = await self.dex_trader.sell_token(position.contract_address, tokens, slippage)
-                if sold and sold > 0:
-                    position.tx_hash_sell = tx
-                    return float(sold)
-                last_err = f"0 tokens sold tx={tx}"
-            except Exception as e:
-                last_err = e
-                logger.warning(f"{tag} sell attempt {attempt + 1}/2 error for ${position.ticker}: {e}")
-            await asyncio.sleep(1)
-        logger.error(f"{tag} sell failed for ${position.ticker}: {last_err}")
-        return 0.0
+    async def _close(self, position, reason, multiplier):
+        position.pnl_usd = position.accumulated_pnl_usd - position.gas_cost_usd
+        position.pnl_pct = position.pnl_usd / position.stake_usd * 100 if position.stake_usd else 0
+        position.pnl_basis = "wallet_delta_less_receipt_gas" if position.cash_measurement_complete else "mark_estimate_less_receipt_gas"
+        if self.config.DRY_RUN:
+            position.pnl_basis = "paper_model"
+        position.exit_time = datetime.now(timezone.utc)
+        position.exit_price_eth = position.entry_price_eth * multiplier
+        position.status = (PositionStatus.CLOSED_TIMEOUT if "timeout" in reason.lower() else
+                           PositionStatus.CLOSED_TP if position.pnl_usd > 0 else PositionStatus.CLOSED_SL)
+        self._persist(position)
+        if asyncio.iscoroutinefunction(self.on_position_closed):
+            await self.on_position_closed(position, position.pnl_usd > 0)
+        else:
+            self.on_position_closed(position, position.pnl_usd > 0)
 
-    async def _monitor(self, position: Position):
+    async def _execute_exit(self, position):
+        pending = position.pending_exit
+        if not pending:
+            return False
+        rung, multiplier = pending["rung"], pending["multiplier"]
+        guard = self.dex_trader if hasattr(self.dex_trader, "operations") else None
+        operation = None
         try:
-            if not hasattr(position, "remaining_tokens") or position.remaining_tokens <= 0:
-                position.remaining_tokens = position.tokens_bought
-
-            slippage = getattr(self.config, "SLIPPAGE_PCT", 15.0)
-            tp1_target = float(getattr(self.config, "TP1_MULTIPLIER", 1.20))
-            tp1_ratio = float(getattr(self.config, "TP1_RATIO", 0.40))
-            tp2_target = float(getattr(self.config, "TP2_MULTIPLIER", 1.40))
-            tp2_ratio = float(getattr(self.config, "TP2_RATIO", 0.40))
-            tp3_target = float(getattr(self.config, "TP3_MULTIPLIER", 5.00))
-            sl_target = float(getattr(self.config, "SL_MULTIPLIER", 0.50))
-            trail_delta = float(getattr(self.config, "TRAILING_STOP_DELTA", 0.25))
-            stagnant_timeout_mins = int(getattr(self.config, "STAGNANT_TIMEOUT_MINUTES", 25))
-            runner_timeout_mins = int(getattr(self.config, "RUNNER_TIMEOUT_MINUTES", 120))
-
-            # A resumed position keeps its ratcheted stop. Resetting these to the
-            # initial values would drop a post-TP1 stop from 0.95x back to 0.50x and
-            # hand back profit the ladder had already locked in.
-            position.peak_multiplier = max(1.0, getattr(position, "peak_multiplier", 1.0) or 1.0)
-            if not (getattr(position, "tp1_hit", False) or getattr(position, "tp2_hit", False)):
-                position.trailing_stop_multiplier = sl_target
-
-            while True:
-                await asyncio.sleep(getattr(self.config, "PRICE_POLL_SECONDS", 5))
-                try:
-                    current_price_eth = await self.dex_trader.get_token_price_eth(position.contract_address)
-                except Exception as e:
-                    logger.debug(f"Price lookup temporary error for ${position.ticker}: {e}")
-                    continue
-
-                if current_price_eth <= 0.0:
-                    logger.debug(f"Waiting for live DEX price quote for ${position.ticker}...")
-                    continue
-
-                if not hasattr(position, "entry_price_eth") or position.entry_price_eth <= 0.0:
-                    position.entry_price_eth = current_price_eth
-                    position.tokens_bought = position.stake_eth / current_price_eth if current_price_eth > 0 else position.tokens_bought
-                    position.remaining_tokens = position.tokens_bought
-                    self._persist(position)
-
-                multiplier = current_price_eth / position.entry_price_eth if position.entry_price_eth > 0 else 1.0
-                if multiplier > 50.0 * max(1.0, position.peak_multiplier):
-                    logger.warning(
-                        f"⚠️ Detected potential phantom API price spike on ${position.ticker} "
-                        f"({multiplier:.1f}x vs peak {position.peak_multiplier:.1f}x). Clamping outlier quote."
-                    )
-                    continue
-
-                if multiplier > position.peak_multiplier:
-                    position.peak_multiplier = multiplier
-
-                if getattr(position, "tp2_hit", False):
-                    dynamic_stop = max(1.20, position.peak_multiplier - trail_delta)
-                    position.trailing_stop_multiplier = max(position.trailing_stop_multiplier, dynamic_stop)
-                elif getattr(position, "tp1_hit", False):
-                    dynamic_stop = max(0.95, position.peak_multiplier - trail_delta)
-                    position.trailing_stop_multiplier = max(position.trailing_stop_multiplier, dynamic_stop)
-                else:
-                    position.trailing_stop_multiplier = sl_target
-
-                now = datetime.now(timezone.utc)
-                entry_time = position.entry_time.replace(tzinfo=timezone.utc) if position.entry_time.tzinfo is None else position.entry_time
-                elapsed_minutes = (now - entry_time).total_seconds() / 60
-
-                if not getattr(position, "tp1_hit", False):
-                    target_info = f"TP1: {tp1_target:.2f}x (40%)"
-                    stop_info = f"SL: {position.trailing_stop_multiplier:.2f}x"
-                elif not getattr(position, "tp2_hit", False):
-                    target_info = f"TP2: {tp2_target:.2f}x (40%)"
-                    stop_info = f"Trail SL: {position.trailing_stop_multiplier:.2f}x"
-                else:
-                    target_info = f"TP3 Moonbag: {tp3_target:.2f}x (20%)"
-                    stop_info = f"Trail SL: {position.trailing_stop_multiplier:.2f}x (Guaranteed Profit)"
-
-                logger.info(
-                    f"Tracking ${position.ticker}: Multiplier: {multiplier:.2f}x (Peak: {position.peak_multiplier:.2f}x) | "
-                    f"{target_info} | {stop_info} | Time: {elapsed_minutes:.1f}m"
-                )
-
-                if not getattr(position, "tp1_hit", False) and (multiplier >= tp1_target or round(multiplier, 2) >= tp1_target):
-                    tokens_to_sell = min(position.tokens_bought * tp1_ratio, position.remaining_tokens)
-                    logger.info(
-                        f"🎯 TP1 HIT for ${position.ticker} ({multiplier:.2f}x >= {tp1_target:.2f}x)! "
-                        f"Selling {tp1_ratio*100:.0f}% ({tokens_to_sell:,.2f} tokens)..."
-                    )
-                    sold = await self._sell_or_retry(position, tokens_to_sell, slippage, "TP1")
-                    if sold <= 0:
-                        logger.error(f"TP1 sell did not fill for ${position.ticker} — will retry next poll")
-                        continue
-                    position.tp1_hit = True
-                    position.tp1_sold_tokens = sold
-                    position.remaining_tokens = max(0.0, position.remaining_tokens - sold)
-                    partial_pnl_usd = (multiplier - 1.0) * (position.stake_usd * tp1_ratio)
-                    position.tp1_pnl_usd = partial_pnl_usd
-                    position.accumulated_pnl_usd += partial_pnl_usd
-                    position.trailing_stop_multiplier = 0.95
-                    self._persist(position)
-                    log_event(
-                        "tranche_exit", rung="TP1", position_id=position.id,
-                        ticker=position.ticker, contract_address=position.contract_address,
-                        multiplier=multiplier, tokens_sold=sold,
-                        pnl_usd=partial_pnl_usd, remaining_tokens=position.remaining_tokens,
-                        trailing_stop_multiplier=position.trailing_stop_multiplier,
-                    )
-                    logger.info(
-                        f"✅ TP1 COMPLETED: Sold {sold:,.2f} ${position.ticker} (Secured +${partial_pnl_usd:.2f} profit). "
-                        f"Stop-Loss ratcheted to 0.95x. Remaining {position.remaining_tokens:,.2f} tokens riding to {tp2_target:.2f}x!"
-                    )
-                    continue
-
-                if getattr(position, "tp1_hit", False) and not getattr(position, "tp2_hit", False) and (
-                    multiplier >= tp2_target or round(multiplier, 2) >= tp2_target
-                ):
-                    tokens_to_sell = min(position.tokens_bought * tp2_ratio, position.remaining_tokens)
-                    logger.info(
-                        f"🎯 TP2 HIT for ${position.ticker} ({multiplier:.2f}x >= {tp2_target:.2f}x)! "
-                        f"Selling {tp2_ratio*100:.0f}% ({tokens_to_sell:,.2f} tokens)..."
-                    )
-                    sold = await self._sell_or_retry(position, tokens_to_sell, slippage, "TP2")
-                    if sold <= 0:
-                        logger.error(f"TP2 sell did not fill for ${position.ticker} — will retry next poll")
-                        continue
-                    position.tp2_hit = True
-                    position.tp2_sold_tokens = sold
-                    position.remaining_tokens = max(0.0, position.remaining_tokens - sold)
-                    partial_pnl_usd = (multiplier - 1.0) * (position.stake_usd * tp2_ratio)
-                    position.tp2_pnl_usd = partial_pnl_usd
-                    position.accumulated_pnl_usd += partial_pnl_usd
-                    position.trailing_stop_multiplier = 1.20
-                    self._persist(position)
-                    log_event(
-                        "tranche_exit", rung="TP2", position_id=position.id,
-                        ticker=position.ticker, contract_address=position.contract_address,
-                        multiplier=multiplier, tokens_sold=sold,
-                        pnl_usd=partial_pnl_usd, remaining_tokens=position.remaining_tokens,
-                        trailing_stop_multiplier=position.trailing_stop_multiplier,
-                    )
-                    logger.info(
-                        f"✅ TP2 COMPLETED: Sold {sold:,.2f} ${position.ticker} (Secured +${partial_pnl_usd:.2f} profit). "
-                        f"🎉 PRINCIPAL 100% RETURNED TO WALLET! Remaining {position.remaining_tokens:,.2f} (20% Moonbag) riding risk-free to {tp3_target:.2f}x!"
-                    )
-                    continue
-
-                should_close = False
-                close_reason = ""
-                tokens_to_close = position.remaining_tokens
-                is_derisked = getattr(position, "tp1_hit", False) or getattr(position, "tp2_hit", False)
-
-                if getattr(position, "tp2_hit", False) and multiplier >= tp3_target:
-                    should_close = True
-                    close_reason = f"🚀 TP3 MOONSHOT HIT ({multiplier:.2f}x >= {tp3_target:.2f}x)"
-                    position.tp3_hit = True
-                elif is_derisked and multiplier <= position.trailing_stop_multiplier:
-                    should_close = True
-                    close_reason = (
-                        f"Dynamic Trailing Stop Hit ({multiplier:.2f}x <= {position.trailing_stop_multiplier:.2f}x "
-                        f"| Peak: {position.peak_multiplier:.2f}x)"
-                    )
-                elif not getattr(position, "tp1_hit", False) and multiplier <= sl_target and current_price_eth > 0 and elapsed_minutes >= 0.15:
-                    should_close = True
-                    close_reason = f"Initial Stop Loss ({multiplier:.2f}x <= {sl_target:.2f}x)"
-                elif not is_derisked and elapsed_minutes > stagnant_timeout_mins:
-                    should_close = True
-                    close_reason = f"Stagnation Timeout ({elapsed_minutes:.1f}m > {stagnant_timeout_mins}m)"
-                elif is_derisked and elapsed_minutes > runner_timeout_mins:
-                    should_close = True
-                    close_reason = f"Moonbag Hold Limit ({elapsed_minutes:.1f}m > {runner_timeout_mins}m)"
-
-                if should_close:
-                    logger.info(f"Closing position ${position.ticker}: {close_reason}")
-                    sold = await self._sell_or_retry(position, tokens_to_close, slippage, "CLOSE")
-                    if sold <= 0 and tokens_to_close > 0:
-                        logger.error(f"Close sell did not fill for ${position.ticker} — will retry next poll")
-                        continue
-                    sell_tx = position.tx_hash_sell or ""
-                    remaining_ratio = position.remaining_tokens / position.tokens_bought if position.tokens_bought > 0 else 1.0
-                    final_leg_pnl_usd = (multiplier - 1.0) * (position.stake_usd * remaining_ratio)
-                    total_pnl_usd = (position.tp1_pnl_usd or 0.0) + (position.tp2_pnl_usd or 0.0) + final_leg_pnl_usd
-                    is_win = total_pnl_usd > 0.0
-                    position.pnl_usd = total_pnl_usd
-                    position.pnl_pct = (total_pnl_usd / position.stake_usd) * 100 if position.stake_usd else 0.0
-                    position.status = PositionStatus.CLOSED_TP if is_win else PositionStatus.CLOSED_SL
-                    position.exit_time = datetime.now(timezone.utc)
-                    position.exit_price_eth = current_price_eth
-                    position.tx_hash_sell = sell_tx
-                    if asyncio.iscoroutinefunction(self.on_position_closed):
-                        await self.on_position_closed(position, is_win)
-                    else:
-                        self.on_position_closed(position, is_win)
-                    break
-
-        except asyncio.CancelledError:
-            logger.info(f"Monitoring cancelled for position {position.id}")
-        except Exception as e:
-            logger.error(f"Error in monitor loop for {position.ticker}: {e}", exc_info=True)
-            position.status = PositionStatus.CLOSED_ERROR
-            if asyncio.iscoroutinefunction(self.on_position_closed):
-                await self.on_position_closed(position, False)
+            if guard:
+                operation = next((o for o in guard.operations.values()
+                                  if o["side"] == "sell" and o["token"].lower() == position.contract_address.lower()), None)
+                if operation and operation["state"] == "prepared" and not operation["transactions"]:
+                    guard.acknowledge(operation["id"])
+                    operation = None
+            if operation:
+                if operation["id"] in position.completed_sell_operations:
+                    guard.acknowledge(operation["id"])
+                    return False
+                sold = await guard.reconcile(operation)
+                if sold is None:
+                    logger.error("Exit for $%s awaiting transaction reconciliation", position.ticker)
+                    return False
+                tx = operation["tx_hash"]
             else:
-                self.on_position_closed(position, False)
+                tx, sold = await self.dex_trader.sell_token(
+                    position.contract_address, pending["tokens"], self.config.SLIPPAGE_PCT)
+                if guard:
+                    operation = guard.last_operation
+            if not math.isfinite(sold) or sold <= 0:
+                return False
+        except ExecutionUncertain as exc:
+            logger.error("Exit for $%s requires reconciliation: %s", position.ticker, exc)
+            return False
+        except Exception as exc:
+            logger.warning("Exit for $%s failed before a verified fill: %s", position.ticker, exc)
+            return False
+
+        sold = min(float(sold), position.remaining_tokens)
+        ratio = sold / position.tokens_bought
+        pnl = (multiplier - 1.0) * position.stake_usd * ratio
+        if self.config.DRY_RUN:
+            pnl = (multiplier * (1 - self.config.PAPER_SLIPPAGE_PCT / 100) - 1) * position.stake_usd * ratio
+            position.gas_cost_usd += self.config.PAPER_FEE_PER_SWAP_USD
+        if operation and operation.get("cash_delta_usd") is not None:
+            gas_usd = guard.gas_eth(operation) * operation["eth_price_usd"]
+            proceeds = operation["cash_delta_usd"] + gas_usd
+            pnl = proceeds - position.stake_usd * ratio
+        else:
+            position.cash_measurement_complete = False
+        position.accumulated_pnl_usd += pnl
+        position.remaining_tokens = max(0.0, position.remaining_tokens - sold)
+        position.tx_hash_sell = tx
+        if operation:
+            usd_per_eth = position.stake_usd / position.stake_eth if position.stake_eth else 0
+            position.gas_cost_usd += guard.gas_eth(operation) * operation.get("eth_price_usd", usd_per_eth)
+            position.completed_sell_operations.append(operation["id"])
+        tolerance = max(position.tokens_bought * 1e-6, 1e-18)
+        if rung == "TP1":
+            position.tp1_sold_tokens += sold
+            position.tp1_pnl_usd += pnl
+            position.tp1_hit = position.tp1_sold_tokens + tolerance >= position.tokens_bought * self.config.TP1_RATIO
+            if position.tp1_hit:
+                position.trailing_stop_multiplier = max(position.trailing_stop_multiplier, 0.95)
+        elif rung == "TP2":
+            position.tp2_sold_tokens += sold
+            position.tp2_pnl_usd += pnl
+            position.tp2_hit = position.tp2_sold_tokens + tolerance >= position.tokens_bought * self.config.TP2_RATIO
+            if position.tp2_hit:
+                position.trailing_stop_multiplier = max(position.trailing_stop_multiplier, 1.20)
+        remaining_order = max(0.0, pending["tokens"] - sold)
+        position.pending_exit = ({**pending, "tokens": min(remaining_order, position.remaining_tokens)}
+                                 if remaining_order > tolerance and position.remaining_tokens > tolerance else None)
+        # First persist the actual fill, then acknowledge its journal record.
+        self._persist(position)
+        if operation:
+            guard.acknowledge(operation["id"])
+        log_event("tranche_exit", rung=rung, position_id=position.id, ticker=position.ticker,
+                  contract_address=position.contract_address, multiplier=multiplier,
+                  tokens_sold=sold, pnl_usd=pnl, pnl_basis="wallet_delta" if position.cash_measurement_complete else "mark_estimate",
+                  gas_cost_usd=position.gas_cost_usd, remaining_tokens=position.remaining_tokens,
+                  trailing_stop_multiplier=position.trailing_stop_multiplier)
+        if position.remaining_tokens <= tolerance:
+            position.remaining_tokens = 0.0
+            position.pending_exit = None
+            await self._close(position, pending["reason"], multiplier)
+            return True
+        return False
+
+    async def _tick(self, position):
+        guard = self.dex_trader if hasattr(self.dex_trader, "operations") else None
+        if guard:
+            # Crash after persisting a fill but before acknowledging its journal.
+            for operation_id in position.completed_sell_operations:
+                if operation_id in guard.operations:
+                    self._persist(position)
+                    guard.acknowledge(operation_id)
+        if position.remaining_tokens <= max(position.tokens_bought * 1e-6, 1e-18):
+            await self._close(position, "recovered completed exit", getattr(position, "peak_multiplier", 1.0))
+            return True
+        if position.pending_exit:
+            unresolved = guard and any(o["side"] == "sell" and o["token"].lower() == position.contract_address.lower()
+                                       for o in guard.operations.values())
+            if not unresolved:
+                # Re-price an unsubmitted remainder. A failed TP attempt must
+                # not prevent a later stop from closing the whole position.
+                fresh = await self.dex_trader.get_token_price_eth(position.contract_address)
+                if math.isfinite(fresh) and fresh > 0 and position.entry_price_eth > 0:
+                    multiplier = fresh / position.entry_price_eth
+                    position.pending_exit["multiplier"] = multiplier
+                    if multiplier <= position.trailing_stop_multiplier:
+                        position.pending_exit.update(rung="CLOSE", reason="Stop while exit pending",
+                                                     tokens=position.remaining_tokens)
+                    self._persist(position)
+            return await self._execute_exit(position)
+        now = datetime.now(timezone.utc)
+        entry = position.entry_time
+        if entry.tzinfo is None:
+            entry = entry.replace(tzinfo=timezone.utc)
+        elapsed = (now - entry).total_seconds() / 60
+        derisked = position.tp1_hit or position.tp2_hit
+        timeout = self.config.RUNNER_TIMEOUT_MINUTES if derisked else self.config.STAGNANT_TIMEOUT_MINUTES
+        price = await self.dex_trader.get_token_price_eth(position.contract_address)
+        if not math.isfinite(price) or price <= 0:
+            logger.warning("No usable price for $%s; position remains open (age %.1fm)", position.ticker, elapsed)
+            return False
+        if not math.isfinite(position.entry_price_eth) or position.entry_price_eth <= 0 or position.tokens_bought <= 0:
+            raise ValueError("invalid entry measurement; refusing to invent an entry price")
+        multiplier = price / position.entry_price_eth
+        if multiplier > 50 * max(1.0, position.peak_multiplier):
+            logger.warning("Rejected outlier price for $%s", position.ticker)
+            return False
+        old_peak, old_stop = position.peak_multiplier, position.trailing_stop_multiplier
+        position.peak_multiplier = max(1.0, old_peak, multiplier)
+        if position.tp2_hit:
+            position.trailing_stop_multiplier = max(old_stop, 1.20, position.peak_multiplier - self.config.TRAILING_STOP_DELTA)
+        elif position.tp1_hit:
+            position.trailing_stop_multiplier = max(old_stop, 0.95, position.peak_multiplier - self.config.TRAILING_STOP_DELTA)
+        else:
+            position.trailing_stop_multiplier = self.config.SL_MULTIPLIER
+        if (old_peak, old_stop) != (position.peak_multiplier, position.trailing_stop_multiplier):
+            self._persist(position)
+        logger.info("Tracking $%s: Multiplier: %.2fx (Peak: %.2fx) | Stop: %.2fx | Time: %.1fm",
+                    position.ticker, multiplier, position.peak_multiplier, position.trailing_stop_multiplier, elapsed)
+        rung = reason = None
+        tokens = position.remaining_tokens
+        # Stops and time limits take priority over another profit tranche.
+        if multiplier <= position.trailing_stop_multiplier:
+            rung, reason = "CLOSE", "Trailing stop" if derisked else "Initial stop loss"
+        elif elapsed >= timeout:
+            rung, reason = "CLOSE", "Position timeout"
+        elif not position.tp1_hit and multiplier >= self.config.TP1_MULTIPLIER:
+            rung, reason = "TP1", "First profit target"
+            tokens = min(tokens, position.tokens_bought * self.config.TP1_RATIO - position.tp1_sold_tokens)
+        elif position.tp1_hit and not position.tp2_hit and multiplier >= self.config.TP2_MULTIPLIER:
+            rung, reason = "TP2", "Second profit target"
+            tokens = min(tokens, position.tokens_bought * self.config.TP2_RATIO - position.tp2_sold_tokens)
+        elif position.tp2_hit and multiplier >= self.config.TP3_MULTIPLIER:
+            rung, reason = "CLOSE", "Final profit target"
+            position.tp3_hit = True
+        if rung and tokens > 0:
+            position.pending_exit = dict(rung=rung, reason=reason, multiplier=multiplier, tokens=tokens)
+            self._persist(position)
+            return await self._execute_exit(position)
+        return False
+
+    async def _monitor(self, position):
+        try:
+            # Fresh entries set remaining_tokens before persistence. Retain legacy
+            # recovery for snapshots written before that field was initialized.
+            if position.remaining_tokens <= 0 and not position.completed_sell_operations and not position.tx_hash_sell:
+                position.remaining_tokens = position.tokens_bought
+                self._persist(position)
+            while not self._stopping:
+                await asyncio.sleep(getattr(self.config, "PRICE_POLL_SECONDS", 2))
+                if self._stopping:
+                    break
+                try:
+                    if await self._tick(position):
+                        break
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Monitor tick failed for $%s; keeping holdings tracked and retrying", position.ticker)
+        except asyncio.CancelledError:
+            logger.info("Monitoring cancelled for position %s", position.id)
         finally:
             self._tasks.pop(position.id, None)

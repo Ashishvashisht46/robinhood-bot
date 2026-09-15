@@ -144,6 +144,38 @@ def main():
         check("PnL lands on the close day", counters2["2026-09-14"].get("pnl_usd"), -0.93)
         check("open day carries no PnL", counters2["2026-09-13"].get("pnl_usd"), None)
 
+        # --- same ticker traded twice in one day ------------------------------
+        # One ledger event was being reused for every close of that ticker that
+        # day, so both rows rendered with the FIRST close's time and P&L. The
+        # counters stayed right while the trade list went quietly wrong.
+        for name in os.listdir(tmp):
+            os.remove(os.path.join(tmp, name))
+        with open(os.path.join(tmp, "bot.log"), "w", encoding="utf-8") as fh:
+            fh.writelines([
+                line(D, "12:00:00", "Executing BUY for $TWICE: Stake $1.00 (0.00040 ETH) | State: baseline"),
+                line(D, "12:00:01", "Position opened: t1 for $TWICE (100.00 tokens)"),
+                line(D, "12:12:16", "Position closed: $TWICE | Win: False | PnL: $-0.61 | New Balance: $8.28 | Next State: BASELINE"),
+                line(D, "13:00:00", "Executing BUY for $TWICE: Stake $1.00 (0.00040 ETH) | State: baseline"),
+                line(D, "13:00:01", "Position opened: t2 for $TWICE (100.00 tokens)"),
+                line(D, "13:05:01", "Position closed: $TWICE | Win: False | PnL: $-0.06 | New Balance: $9.07 | Next State: BASELINE"),
+            ])
+        recs3 = dd.parse_logs()
+        led = [
+            {"kind": "position_closed", "ts": f"{D}T12:12:16", "ticker": "TWICE",
+             "closed_day": D, "closed_at": "12:12:16", "pnl_usd": -0.61, "tx_hash_sell": "0xaaa"},
+            {"kind": "position_closed", "ts": f"{D}T13:05:01", "ticker": "TWICE",
+             "closed_day": D, "closed_at": "13:05:01", "pnl_usd": -0.06, "tx_hash_sell": "0xbbb"},
+        ]
+        twice = [t for t in dd.build_trades(recs3, led) if t.get("outcome") == "closed"]
+        check("both closes of the same ticker are kept",
+              [(t["closed_at"], t["pnl_usd"]) for t in twice],
+              [("12:12:16", -0.61), ("13:05:01", -0.06)])
+        check("each ledger row is consumed once",
+              [t.get("tx_hash_sell") for t in twice], ["0xaaa", "0xbbb"])
+        check("listed P&L sums to the day counter",
+              round(sum(t["pnl_usd"] for t in twice), 2),
+              dd.day_counters(recs3)[D]["pnl_usd"])
+
         # --- reconstructed vs ledger ------------------------------------------
         # A row rebuilt from text has no entry price and no buy tx hash. It must say
         # so, because a reconstructed row that looks complete is a lie.
