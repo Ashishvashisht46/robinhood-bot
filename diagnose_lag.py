@@ -182,7 +182,38 @@ def check_signatures():
         ok("none of the known delivery faults appear in these logs")
 
 
-def check_measured_lag():
+def check_coverage(recv, starts):
+    """
+    Is the bot actually UP? A bot that runs in short bursts looks like a lag
+    problem: each restart replays what it missed, so calls arrive stamped
+    minutes or hours old, and almost nothing arrives in between.
+    """
+    print("\n7. MESSAGE VOLUME  (is the bot even up?)")
+    if len(recv) < 2:
+        warn("not enough messages to judge")
+        return
+    hours = (recv[-1] - recv[0]).total_seconds() / 3600
+    if hours < 1:
+        warn("less than an hour of history")
+        return
+    rate = len(recv) / hours
+    print(f"   {len(recv)} messages over {hours:.0f}h = {rate:.1f}/hour")
+    print(f"   a continuously-running bot on this channel sees roughly 5/hour")
+    if rate < 2:
+        bad(f"receiving ~{rate/5:.0%} of the expected traffic.")
+        print("         The bot is NOT staying up. This looks like a lag problem")
+        print("         because every restart replays what was missed -- but the")
+        print("         real fault is uptime, not delivery.")
+        if starts:
+            print(f"         {len(starts)} starts for {len(recv)} messages "
+                  f"= {len(recv)/len(starts):.1f} messages per run.")
+    elif rate < 4:
+        warn(f"below the expected ~5/hour - some downtime")
+    else:
+        ok("volume looks right for a continuously-running bot")
+
+
+def check_measured_lag(starts):
     """If the bot logged the real lag, stop inferring and just read it."""
     print("\n6. MEASURED DELIVERY LAG (from the log itself)")
     lags = []
@@ -199,6 +230,18 @@ def check_measured_lag():
         print("         through a few calls, then run this again for exact numbers.")
         return
     lags.sort()
+    # One sample is not a measurement. The first messages after a restart are
+    # catch-up replaying the downtime, so judging lag from them says nothing
+    # about live delivery -- an earlier version of this tool called a single
+    # backfill message "CONFIRMED delivery lag", which was simply wrong.
+    if len(lags) < 5:
+        warn(f"only {len(lags)} lag sample(s) - not enough to judge.")
+        print(f"         values seen: {[f'{x:.0f}s' for x in lags]}")
+        print("         Leave the bot running through 10+ calls, then re-run.")
+        if lags and max(lags) > 600:
+            print("         A single huge value right after a restart is catch-up")
+            print("         replaying downtime, NOT a live delivery fault.")
+        return
     med = st.median(lags)
     p90 = lags[int(len(lags) * 0.9)]
     print(f"   n={len(lags)}   median {med:.1f}s   p90 {p90:.1f}s   max {lags[-1]:.0f}s")
@@ -226,7 +269,8 @@ def main() -> int:
     else:
         warn("\nno 'Received message' lines in logs - set log level to DEBUG")
     check_signatures()
-    check_measured_lag()
+    check_measured_lag(starts)
+    check_coverage(recv, starts)
 
     print("\n" + "=" * 66)
     print("  IF THE LIVE STREAM IS BROKEN, TRY IN THIS ORDER")
