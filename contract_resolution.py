@@ -19,6 +19,35 @@ def _unique(addresses):
     return next(iter(values.values())) if len(values) == 1 else None
 
 
+def iter_buttons(buttons=None, reply_markup=None):
+    """Read wrapped button grids and raw Telegram markup without clicking them."""
+    for row in buttons or []:
+        yield from row if isinstance(row, (list, tuple)) else [row]
+    for row in getattr(reply_markup, "rows", None) or []:
+        yield from getattr(row, "buttons", None) or []
+
+
+def button_links(buttons=None, reply_markup=None):
+    """Support legacy .url/.data and current KeyboardInlineButton.type payloads.
+
+    Telethon's message.buttons can be absent on live events. In that case the
+    raw reply_markup is authoritative; its URL lives at button.type.url.
+    Callback bytes are only candidates for the existing allowlisted URL parser,
+    never instructions to click a button or a standalone token address.
+    """
+    links = []
+    for button in iter_buttons(buttons, reply_markup):
+        raw = getattr(button, "button", button)
+        for source in (button, raw, getattr(raw, "type", None)):
+            for attribute in ("url", "data"):
+                value = getattr(source, attribute, None)
+                if isinstance(value, bytes):
+                    value = value.decode("utf-8", errors="replace")
+                if isinstance(value, str) and value and value not in links:
+                    links.append(value)
+    return links
+
+
 def resolve_pair(pair_id, ticker):
     """Lookup only the exact pair explicitly linked by the channel."""
     request = urllib.request.Request(
@@ -45,25 +74,18 @@ def extract_contract(text, entities, buttons, reply_markup, ticker):
     tagged = re.findall(r"\b(?:ca|contract(?: address)?|token(?: address)?|address)\s*[:=]\s*(" + ADDRESS + r")", text, re.I)
     if tagged:
         return _unique(tagged), "explicit" if _unique(tagged) else "ambiguous"
-    links = []
-    for row in buttons or []:
-        for button in row if isinstance(row, (list, tuple)) else [row]:
-            value = getattr(button, "url", None) or getattr(button, "data", None)
-            if isinstance(value, bytes):
-                value = value.decode("utf-8", errors="replace")
-            if isinstance(value, str):
-                links.append(value)
-    for row in getattr(reply_markup, "rows", None) or []:
-        for button in getattr(row, "buttons", None) or []:
-            value = getattr(button, "url", None)
-            if value:
-                links.append(value)
+    links = button_links(buttons, reply_markup)
     links += [e.url for e in entities or [] if getattr(e, "url", None)]
     links += re.findall(r"https?://[^\s<>]+", text)
     tokens, pools = [], []
-    for link in links:
-        url = urlsplit(unquote(link))
-        host = (url.hostname or "").lower().removeprefix("www.")
+    for link in dict.fromkeys(links):
+        try:
+            url = urlsplit(unquote(link))
+            host = (url.hostname or "").lower().removeprefix("www.")
+        except ValueError:
+            continue  # One malformed button must not hide another valid URL.
+        if url.scheme.lower() not in ("http", "https"):
+            continue
         path = url.path.lower()
         addresses = re.findall(ADDRESS, url.path)
         if host == "dexscreener.com" and path.startswith("/robinhood/"):

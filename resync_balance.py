@@ -2,8 +2,9 @@
 """
 Teach the bot about money you added to (or removed from) the wallet.
 
-    python resync_balance.py            # show what it would change
-    python resync_balance.py --apply    # change it
+    python resync_balance.py                        # show what it would change
+    python resync_balance.py --apply                # change it (bot must be stopped)
+    python resync_balance.py --apply --stop-bot     # stop the bot, then change it
 
 The strategy engine does NOT read your wallet. `balance_usd` starts at
 INITIAL_CAPITAL_USD and only ever moves by realised P&L, so a deposit is
@@ -27,6 +28,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 from dotenv import load_dotenv
 
@@ -118,14 +120,43 @@ async def main() -> int:
         return 0
 
     running = bot_running()
+    if running != 0 and "--stop-bot" in sys.argv:
+        if open_positions:
+            print()
+            print(f"  REFUSING to auto-stop: {len(open_positions)} position(s) open.")
+            print("  Killing the bot would leave them with no stop-loss. Close them")
+            print("  or stop it yourself when you are ready.")
+            return 1
+        print(f"\n  stopping the bot ({running} process(es))...")
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+             "Where-Object { $_.CommandLine -like '*main.py*' -and "
+             "($_.ExecutablePath -like '*robinhood-bot*' -or "
+             "$_.CommandLine -like '*robinhood-bot*') } | "
+             "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"],
+            capture_output=True, timeout=30)
+        time.sleep(3)
+        running = bot_running()
+        print(f"  stopped ({running} still up)")
+
     if running != 0:
         print()
+        print("  " + "=" * 62)
         print(f"  REFUSING: the bot is running ({running} process(es)).")
+        print("  " + "=" * 62)
         print("  It holds this state in memory and rewrites the file, so the edit")
-        print("  would be silently lost. Stop it (ctrl+c in its window), re-run")
-        print("  this, then start it again.")
+        print("  would be silently lost -- you would restart onto the OLD balance")
+        print("  and the bot would keep refusing every call.")
+        print()
+        print("  Either stop it first (ctrl+c in its window) and re-run this,")
+        print("  or let this do it for you:")
+        print()
+        print("      python resync_balance.py --apply --stop-bot")
+        print()
+        print("  Then start it again with run_bot.bat")
         if open_positions:
-            print(f"  NOTE: {len(open_positions)} position(s) open -- stopping leaves")
+            print(f"\n  NOTE: {len(open_positions)} position(s) open -- stopping leaves")
             print("  them with no stop-loss until you restart.")
         return 1
 

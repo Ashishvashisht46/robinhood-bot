@@ -256,12 +256,15 @@ function render(d) {
       route — that is the slippage guard working, not a defect.</p>
   </section>`);
 
-  const rej = (d.rejections || []).reverse();
-  out.push(`<section><span class="eyebrow">Filtered</span><h2>Calls not traded — ${rej.length}</h2>
+  const rej = [...(d.rejections || [])].reverse();
+  out.push(`<section><span class="eyebrow">Filtered history</span><h2>Skipped entry checks — ${rej.length}</h2>
     ${table(['When', 'Ticker', 'Reason'],
       rej.map(x => `<tr><td class="m dim">${esc(x.day)} ${esc(x.time)}</td>
         <td class="m">$${esc(x.ticker)}</td>
         <td class="wrapcell">${esc(x.reason || 'No contract address identified')}</td></tr>`), true)}
+    <p class="note">Historical checks, including repeated attempts for the same call.
+      This is not a count of unique calls or current blockers. Earlier refusals remain
+      here after a fix; the activity panel above shows the current session.</p>
   </section>`);
 
   const swaps = (d.swaps || []).reverse();

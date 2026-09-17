@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Optional, List, Any
 
 from models import CallSignal
-from contract_resolution import extract_contract
+from contract_resolution import button_links, extract_contract, iter_buttons
 
 logger = logging.getLogger("copytrader")
 
@@ -94,22 +94,18 @@ class MessageParser:
             # failure, so it costs nothing on the happy path.
             if not contract_address:
                 try:
-                    rm_buttons = []
-                    for row in (getattr(reply_markup, "rows", None) or []):
-                        for b in (getattr(row, "buttons", None) or []):
-                            rm_buttons.append(
-                                f"{type(b).__name__}(url={getattr(b, 'url', None)!r},"
-                                f"data={getattr(b, 'data', None)!r})"
-                            )
-                    near = [text[max(0, m.start() - 20):m.start() + 60]
-                            for m in re.finditer("0x", text or "")][:4]
+                    rm_buttons = [
+                        f"{type(b).__name__}(payload={type(getattr(b, 'type', None)).__name__})"
+                        for b in iter_buttons(reply_markup=reply_markup)
+                    ]
                     logger.warning(
                         f"Msg {message_id} NO-CA dump: "
                         f"buttons={type(buttons).__name__ if buttons else None} "
                         f"reply_markup={type(reply_markup).__name__ if reply_markup else None} "
                         f"rm_buttons={rm_buttons or None} "
                         f"entity_types={sorted({type(e).__name__ for e in (entities or [])})} "
-                        f"0x_context={near}"
+                        f"link_candidates={len(button_links(buttons, reply_markup))} "
+                        f"address_source={address_source}"
                     )
                 except Exception as dump_err:
                     logger.warning(f"NO-CA dump failed: {dump_err}")

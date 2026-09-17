@@ -7,6 +7,7 @@ from telethon import TelegramClient, events, errors
 
 from config import Config
 from message_parser import MessageParser
+from contract_resolution import button_links, iter_buttons
 from models import CallSignal
 from trade_ledger import log_event
 from types import SimpleNamespace
@@ -178,26 +179,38 @@ class TelegramListener:
             # address", this says whether the markup arrived at all.
             try:
                 n_rows = len(buttons) if buttons else 0
-                n_btns = sum(len(r) if isinstance(r, list) else 1 for r in (buttons or []))
-                urls = []
-                for row in (buttons or []):
-                    for b in (row if isinstance(row, list) else [row]):
-                        u = getattr(b, "url", None)
-                        if u:
-                            urls.append(u)
+                raw_buttons = list(iter_buttons(reply_markup=reply_markup))
+                n_btns = len(list(iter_buttons(buttons)))
+                urls = button_links(buttons, reply_markup)
                 logger.info(
                     f"msg {message_id}: buttons={'yes' if buttons else 'NO'} "
                     f"rows={n_rows} btns={n_btns} urls={len(urls)} "
                     f"reply_markup={'yes' if reply_markup else 'NO'} "
+                    f"raw_btns={len(raw_buttons)} "
+                    f"payload_types={sorted({type(getattr(b, 'type', None)).__name__ for b in raw_buttons})} "
                     f"entities={len(entities) if entities else 0} "
                     f"text_has_0x={'yes' if '0x' in (text or '') else 'no'}"
                 )
-                for u in urls[:5]:
-                    logger.info(f"    button url: {u}")
             except Exception as diag_err:
                 logger.warning(f"button diagnostic failed: {diag_err}")
 
-            logger.debug(f"Received message {message_id} from channel.")
+            # Record how stale the message already was when it reached us.
+            # Without this, measuring delivery lag means asking Telegram for each
+            # message's post time -- which needs the bot STOPPED, since one
+            # session cannot serve two clients. So the lag could never be
+            # measured while it was actually happening. One field fixes that:
+            # it is now readable from the log alone, on any machine, live.
+            try:
+                posted = timestamp.astimezone(timezone.utc)
+                lag = (datetime.now(timezone.utc) - posted).total_seconds()
+                logger.info(f"Received message {message_id} from channel "
+                            f"(posted {posted:%H:%M:%S}Z, lag {lag:.1f}s)")
+                if lag > 120:
+                    logger.warning(
+                        f"DELIVERY LAG {lag:.0f}s on msg {message_id} -- the call is "
+                        f"already {lag / 60:.1f} min old. Run diagnose_lag.py.")
+            except Exception:
+                logger.debug(f"Received message {message_id} from channel.")
             
             # parse() can make a blocking DexScreener lookup when the message has no
             # contract address. Run it off the event loop, or that http call freezes
