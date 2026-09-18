@@ -8,7 +8,7 @@ import sys
 ROOT = Path(__file__).resolve().parent
 SUITES = ("test_reliability.py", "test_execution_paths.py", "test_inventory_funding.py", "test_ca_resolution.py",
           "test_fill_measurement.py", "test_position_persistence.py", "test_dashboard_data.py", "test_dashboard_status.py",
-          "test_telegram_buttons.py")
+          "test_telegram_buttons.py", "test_fast_path.py")
 BOOTSTRAP = r'''
 import logging, runpy, socket, sys, tempfile
 from test_support import workspace_mkdtemp
