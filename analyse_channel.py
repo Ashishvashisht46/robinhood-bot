@@ -93,25 +93,35 @@ def best_pool(ca: str, cache: dict):
     if key in cache:
         return cache[key]
     d = api(f"/networks/{NETWORK}/tokens/{ca}/pools")
+    if d is None:
+        return None            # the REQUEST failed -- do not cache, try again later
     pool = None
-    if d and d.get("data"):
+    if d.get("data"):
         # deepest pool: thin ones give noisy prices
         best = max(d["data"],
                    key=lambda p: float(p["attributes"].get("reserve_in_usd") or 0))
         pool = best["id"].split("_", 1)[-1]
-    cache[key] = pool
+    cache[key] = pool          # a genuine "this token has no pool" IS worth keeping
     return pool
 
 
 def candles(pool: str, before_ts: int, cache: dict):
+    """Never cache a failure.
+
+    This used to store whatever came back, including []. api() returns None when
+    it gives up against a rate limit, so one throttled run wrote empty series for
+    730 of 1,197 pools -- permanently, because the next call found the key and
+    returned [] without retrying. A later backtest then priced 0 of 1,001 tokens
+    and looked like a broken pipeline rather than a poisoned cache.
+    """
     key = f"ohlcv:{pool}:{before_ts}"
     if key in cache:
         return cache[key]
     d = api(f"/networks/{NETWORK}/pools/{pool}/ohlcv/minute"
             f"?aggregate=1&limit=1000&currency=usd&before_timestamp={before_ts}")
-    rows = []
-    if d:
-        rows = d.get("data", {}).get("attributes", {}).get("ohlcv_list", []) or []
+    if d is None:
+        return []              # failed request; absent from cache so it retries
+    rows = d.get("data", {}).get("attributes", {}).get("ohlcv_list", []) or []
     rows = sorted(rows, key=lambda r: r[0])       # oldest first
     cache[key] = rows
     return rows

@@ -17,6 +17,7 @@ from trade_ledger import log_event, configure_ledger
 from models import CallSignal, Position, PositionStatus, StrategyState
 from message_parser import MessageParser
 from telegram_listener import TelegramListener
+from launch_watcher import LaunchWatcher
 from chain_client import ChainClient
 from dex_trader import DexTrader
 from strategy_engine import StrategyEngine
@@ -26,11 +27,21 @@ from execution_guard import ExecutionGuard, ExecutionUncertain, PreflightFailure
 
 
 class CopyTraderBot:
-    def __init__(self, paper=False):
+    def __init__(self, paper=False, no_telegram=False):
+        self.no_telegram = no_telegram
         self.config = Config()
         if paper:
             self.config.DRY_RUN = True
             self.config.BUY_EVERY_SIGNAL = True
+            # Paper-only stake override. Set AFTER Config() on purpose: config
+            # calls load_dotenv(override=True), so .env beats the shell
+            # environment and a plain BASELINE_STAKE_USD=50 is silently ignored.
+            # Editing .env instead would risk leaving a $50 stake configured
+            # against a $6.79 wallet if the run died.
+            paper_stake = os.getenv("PAPER_STAKE_USD")
+            if paper_stake:
+                self.config.BASELINE_STAKE_USD = float(paper_stake)
+                self.config.COMPOUND_STAKE_USD = float(paper_stake)
         log_dir = os.path.join(self.config.BASE_DIR, "logs", "paper") if self.config.DRY_RUN else os.path.join(self.config.BASE_DIR, "logs")
         setup_logging(log_dir)
         configure_ledger(os.path.join(log_dir, "events.jsonl"))
@@ -56,6 +67,9 @@ class CopyTraderBot:
             on_position_changed=lambda _position: self.strategy_engine.save(),
         )
         self.telegram_listener = TelegramListener(self.config, self.parser, self.enqueue_signal)
+        # Second signal source, off unless LAUNCH_WATCHER_ENABLED=true. Feeds the
+        # same queue, so every gate, stake rule and exit ladder applies unchanged.
+        self.launch_watcher = LaunchWatcher(self.config, self.enqueue_signal)
         self._recovery_task = None
 
     async def start(self):
@@ -101,6 +115,18 @@ class CopyTraderBot:
         await self.recover_open_positions()
         self.signal_queue.start()
         self._recovery_task = asyncio.create_task(self._recovery_loop())
+
+        # Must start BEFORE the listener: telegram_listener.start() ends in
+        # run_until_disconnected() and never returns.
+        await self.launch_watcher.start()
+
+        if self.no_telegram:
+            # The watcher is the only signal source. Nothing else blocks, so the
+            # process has to be held open explicitly or start() would return and
+            # shut everything down.
+            self.logger.info("Telegram DISABLED -- running on the launch watcher alone.")
+            await asyncio.Event().wait()
+            return
 
         self.logger.info("Connecting to Telegram channel listener...")
         await self.telegram_listener.start()
@@ -314,7 +340,9 @@ class CopyTraderBot:
 
     async def shutdown(self):
         self.logger.info("Shutting down bot...")
-        await self.telegram_listener.stop()
+        if not self.no_telegram:
+            await self.telegram_listener.stop()
+        await self.launch_watcher.stop()
         await self.signal_queue.stop()
         if self._recovery_task:
             self._recovery_task.cancel()
@@ -328,15 +356,17 @@ async def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--paper", action="store_true", help="Force paper mode with isolated state and all eligible signals")
+    parser.add_argument("--no-telegram", action="store_true",
+                        help="Run on the on-chain launch watcher alone, with no channel")
     args = parser.parse_args()
     from pathlib import Path
     from instance_lock import InstanceLock
     with InstanceLock(Path(__file__).resolve().parent / "cache" / "bot.lock"):
-        await run_bot(args.paper)
+        await run_bot(args.paper, args.no_telegram)
 
 
-async def run_bot(paper):
-    bot = CopyTraderBot(paper=paper)
+async def run_bot(paper, no_telegram=False):
+    bot = CopyTraderBot(paper=paper, no_telegram=no_telegram)
     try:
         await bot.start()
     except (KeyboardInterrupt, asyncio.CancelledError):
