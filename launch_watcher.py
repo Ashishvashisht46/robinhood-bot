@@ -35,10 +35,12 @@ Environment:
 import argparse
 import asyncio
 import collections
+import json
 import logging
 import os
 import sys
 import time
+import urllib.request
 from datetime import datetime, timezone
 
 from contract_resolution import SYSTEM
@@ -59,6 +61,16 @@ MAX_PER_HOUR = int(os.getenv("WATCH_MAX_PER_HOUR", "4"))
 
 MAX_POOLS_FOR_A_LAUNCH = 8      # quote tokens sit on hundreds of pairs
 PENDING_TTL_BLOCKS = 36_000     # ~1h; a launch we never judged is dropped
+
+# The channel's own floors, read off the minimum of their 223 published calls
+# (AD-033). Matching these makes the watcher select like they do, ~5 minutes
+# earlier. Holders comes free from transfer logs; the other three need a live
+# lookup, so they are only queried for tokens that already clear holders.
+MATCH_CHANNEL = os.getenv("MATCH_CHANNEL_CRITERIA", "true").lower() == "true"
+FLOOR_MCAP = float(os.getenv("FLOOR_MCAP_USD", "15000"))
+FLOOR_LIQUIDITY = float(os.getenv("FLOOR_LIQUIDITY_USD", "5000"))
+FLOOR_VOLUME = float(os.getenv("FLOOR_VOLUME_USD", "6000"))
+GT = "https://api.geckoterminal.com/api/v2"
 
 
 def signal_id(address: str) -> int:
@@ -144,6 +156,47 @@ class LaunchWatcher:
             return False
         return self.pool_count[token] <= MAX_POOLS_FOR_A_LAUNCH
 
+    def _channel_metrics(self, token):
+        """Liquidity, market cap and volume -- the fields the channel publishes
+        that transfer logs cannot give. Returns None when unknown, which is
+        treated as a REJECT: an unquotable token is not one to buy blind."""
+        try:
+            req = urllib.request.Request(
+                f"{GT}/networks/robinhood/tokens/{token}/pools",
+                headers={"User-Agent": "launch-watcher/1", "Accept": "application/json"})
+            d = json.load(urllib.request.urlopen(req, timeout=15))
+        except Exception as exc:
+            logger.debug("metrics lookup failed for %s: %s", token, exc)
+            return None
+        pools = d.get("data") or []
+        if not pools:
+            return None
+        best = max(pools, key=lambda p: float(p["attributes"].get("reserve_in_usd") or 0))
+        a = best["attributes"]
+        vol = a.get("volume_usd") or {}
+        return {
+            "liquidity": float(a.get("reserve_in_usd") or 0),
+            "mcap": float(a.get("fdv_usd") or a.get("market_cap_usd") or 0),
+            "volume": float(vol.get("h24") or vol.get("h1") or 0),
+        }
+
+    def passes_channel(self, holders, m):
+        """The channel's floors. Their minimum published call, not a guess."""
+        if holders < 20:
+            return False, f"holders {holders} < 20"
+        if not MATCH_CHANNEL:
+            return True, "holders only (MATCH_CHANNEL_CRITERIA=false)"
+        if m is None:
+            return False, "no pool/metrics"
+        if m["liquidity"] < FLOOR_LIQUIDITY:
+            return False, f"liquidity ${m['liquidity']:,.0f} < ${FLOOR_LIQUIDITY:,.0f}"
+        if m["mcap"] < FLOOR_MCAP:
+            return False, f"mcap ${m['mcap']:,.0f} < ${FLOOR_MCAP:,.0f}"
+        if m["volume"] < FLOOR_VOLUME:
+            return False, f"volume ${m['volume']:,.0f} < ${FLOOR_VOLUME:,.0f}"
+        return True, (f"liq ${m['liquidity']:,.0f} mcap ${m['mcap']:,.0f} "
+                      f"vol ${m['volume']:,.0f}")
+
     def _holders(self, token, launch_block):
         """Distinct wallets that received the token in its first AGE_MINUTES."""
         span = int(AGE_MINUTES * 60 / BLOCK_S)
@@ -193,10 +246,17 @@ class LaunchWatcher:
             holders, transfers = await asyncio.to_thread(self._holders, tok, bn)
             if holders is None or holders < MIN_HOLDERS:
                 continue
+            # Only tokens already past the holder screen get a metrics lookup,
+            # so this costs a few API calls an hour rather than hundreds.
+            m = await asyncio.to_thread(self._channel_metrics, tok) if MATCH_CHANNEL else None
+            ok, why = self.passes_channel(holders, m)
+            if not ok:
+                logger.info("skip %s (%d holders): %s", tok, holders, why)
+                continue
             age = (head - bn) * BLOCK_S / 60
             sig = build_signal(tok, holders, transfers, venue, age)
-            logger.info("LAUNCH SIGNAL %s  %d holders / %d transfers at %.1f min (%s)",
-                        tok, holders, transfers, age, venue)
+            logger.info("LAUNCH SIGNAL %s  %d holders / %d transfers at %.1f min "
+                        "(%s) | %s", tok, holders, transfers, age, venue, why)
             self.emitted.append(time.time())
             await self.on_signal(sig)
 
@@ -273,6 +333,20 @@ def self_test() -> int:
     print("\nlogging actually reaches the bot's handlers:")
     check("logger is the one setup_logging configures",
           logger.name, "copytrader")
+
+    print("\nthe channel's floors are enforced, not just holders:")
+    w3 = LaunchWatcher.__new__(LaunchWatcher)
+    good = {"liquidity": 20_000, "mcap": 50_000, "volume": 30_000}
+    check("passes when everything clears", w3.passes_channel(120, good)[0], True)
+    check("holders below their floor -> reject", w3.passes_channel(19, good)[0], False)
+    check("thin liquidity -> reject",
+          w3.passes_channel(120, {**good, "liquidity": 4_999})[0], False)
+    check("tiny mcap -> reject",
+          w3.passes_channel(120, {**good, "mcap": 14_999})[0], False)
+    check("no volume -> reject",
+          w3.passes_channel(120, {**good, "volume": 5_999})[0], False)
+    check("UNQUOTABLE token is rejected, not waved through",
+          w3.passes_channel(120, None)[0], False)
 
     print("\ndefaults are the safe ones:")
     check("watcher OFF unless explicitly enabled", ENABLED, False)

@@ -10,6 +10,10 @@ from trade_ledger import log_event
 
 logger = logging.getLogger("copytrader")
 
+# One absurd price reading is a bad tick. A RUN of them means the entry price is
+# wrong, not the feed, and the position has no working stop until someone notices.
+OUTLIER_STREAK_LIMIT = 5
+
 
 class PositionMonitor:
     def __init__(self, config, dex_trader, chain_client, on_position_closed: Callable[[Position, bool], Any],
@@ -17,6 +21,7 @@ class PositionMonitor:
         self.config, self.dex_trader, self.chain_client = config, dex_trader, chain_client
         self.on_position_closed, self.on_position_changed = on_position_closed, on_position_changed
         self._tasks: Dict[str, asyncio.Task] = {}
+        self._outlier_streak: Dict[str, int] = {}
         self._stopping = False
 
     def _persist(self, position):
@@ -185,8 +190,32 @@ class PositionMonitor:
             raise ValueError("invalid entry measurement; refusing to invent an entry price")
         multiplier = price / position.entry_price_eth
         if multiplier > 50 * max(1.0, position.peak_multiplier):
-            logger.warning("Rejected outlier price for $%s", position.ticker)
-            return False
+            # Observed live: 1,717 consecutive rejections over 110 minutes while
+            # the position sat with no stop-loss and no take-profit, because the
+            # fill had been quoted against the wrong V4 pool key. It happened to
+            # end +9x; the same blindness on a token going the other way rides it
+            # to zero. Being unable to price something is not a reason to keep
+            # holding it -- it is the reason to get out.
+            streak = self._outlier_streak.get(position.id, 0) + 1
+            self._outlier_streak[position.id] = streak
+            if streak < OUTLIER_STREAK_LIMIT:
+                logger.warning("Rejected outlier price for $%s (%d/%d)",
+                               position.ticker, streak, OUTLIER_STREAK_LIMIT)
+                return False
+            logger.critical(
+                "UNPRICEABLE $%s: %d consecutive outlier reads (price implies %.1fx "
+                "entry). The entry measurement is wrong, so this position has no "
+                "working stop. Closing it.", position.ticker, streak, multiplier)
+            log_event("unpriceable_position", position_id=position.id,
+                      ticker=position.ticker, contract_address=position.contract_address,
+                      consecutive_outliers=streak, implied_multiplier=round(multiplier, 2),
+                      entry_price_eth=position.entry_price_eth, observed_price_eth=price)
+            position.pending_exit = dict(rung="CLOSE",
+                                         reason="unpriceable; entry measurement wrong",
+                                         multiplier=1.0,
+                                         tokens=position.remaining_tokens)
+            return await self._execute_exit(position)
+        self._outlier_streak.pop(position.id, None)
         old_peak, old_stop = position.peak_multiplier, position.trailing_stop_multiplier
         position.peak_multiplier = max(1.0, old_peak, multiplier)
         if position.tp2_hit:

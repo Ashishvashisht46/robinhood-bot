@@ -312,6 +312,36 @@ class CopyTraderBot:
             self.execution.acknowledge(operation["id"])
             await self.position_monitor.start_monitoring(position)
             self.logger.info(f"Position opened: {position.id} for ${position.ticker} ({filled:,.2f} tokens)")
+            # Entry price includes price impact; the monitor marks against spot.
+            # On a thin enough pool those diverge enormously and the position
+            # shows a ~-90% "loss" the instant it opens. Measure it rather than
+            # guess: this is the number that says whether such a trade was ever
+            # executable, or whether the quote was wrong.
+            try:
+                spot = await self.dex_trader.get_token_price_eth(position.contract_address)
+                if spot and position.entry_price_eth:
+                    ratio = spot / position.entry_price_eth
+                    log_event("entry_quality", ticker=position.ticker,
+                              contract_address=position.contract_address,
+                              spot_over_entry=round(ratio, 4),
+                              stake_usd=position.stake_usd)
+                    if ratio < 0.70:
+                        self.logger.warning(
+                            f"THIN POOL {position.ticker}: filled at {1/ratio:.1f}x spot "
+                            f"({(1-ratio)*100:.0f}% impact on ${position.stake_usd:.2f}). "
+                            f"Not tradeable at this size.")
+                    elif ratio > 2.0:
+                        # A fill BETTER than spot is not luck, it is a measurement
+                        # error -- the fill was quoted against a different pool
+                        # than the one being priced. Left unflagged this produced
+                        # a position whose every later price read looked like a
+                        # 50x outlier, so it held for 110 minutes with no stop.
+                        self.logger.critical(
+                            f"ENTRY MISMEASURED {position.ticker}: spot is {ratio:.1f}x "
+                            f"the fill price. Fill and price feed disagree on the pool; "
+                            f"this position's stop-loss will not work.")
+            except Exception as exc:
+                self.logger.debug("entry quality check failed: %s", exc)
             log_event("position_opened", **position.to_dict())
             return SignalResult("opened", "verified fill and persisted position")
         except PreflightFailure as exc:

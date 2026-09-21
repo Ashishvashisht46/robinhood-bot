@@ -139,15 +139,43 @@ def evaluate() -> int:
             _save(ts_path, ts_cache)
         return ts_cache[key]
 
+    # GeckoTerminal allows ~30 requests/minute and api() only backs off AFTER a
+    # failure -- it never paces. Purging the poisoned cache left ~1,000 fetches
+    # to redo, which throttled every one of them and priced 0 of 1,001. Two
+    # calls per token, so 2.2s between tokens keeps us under the limit.
+    import time as _time
+    PACE = 2.2
+    fetched = 0
+
     rows = []
     try:
-        for tok, f in early.items():
+        for i, (tok, f) in enumerate(early.items(), 1):
+            if i % 50 == 0:
+                print(f"  {i}/{len(early)} attempted, {len(rows)} priced",
+                      flush=True)
             lts = launch_ts(real[tok]["block"])
-            pool = best_pool(tok, cache)
-            if not lts or not pool:
+            if not lts:
                 continue
-            ets = lts + ENTRY_AGE * 60
-            c = candles(pool, ets + 360 * 60 + 120, cache)
+            if f"pool:{tok}" not in cache:
+                _time.sleep(PACE)
+                fetched += 1
+            pool = best_pool(tok, cache)
+            if not pool:
+                continue
+            ets = int(lts + ENTRY_AGE * 60)
+            # Prefer ANY cached series for this pool. GeckoTerminal's minute
+            # OHLCV has aged out for most of this window -- a fresh fetch with a
+            # new before_timestamp returns nothing for the older pools, even
+            # though a series fetched days ago is sitting in the cache and spans
+            # the minutes we need. Refetching would throw away the only data
+            # that still exists.
+            have = [k for k in cache if k.startswith(f"ohlcv:{pool}:") and cache[k]]
+            if not have:
+                # Refetching is pointless here: minute OHLCV for this window has
+                # aged out, measured 3 of 4 older pools returning nothing even
+                # with polite pacing. Only cached history can price this period.
+                continue
+            c = max((cache[k] for k in have), key=len)
             a = [r for r in sorted(c, key=lambda r: r[0]) if r[0] >= ets - 60]
             if len(a) < 2:
                 continue
