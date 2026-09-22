@@ -34,3 +34,7 @@ push_both.bat
 
 # Local audit includes private trading results.
 AUDIT_REPORT.md
+
+# scratch log extracts
+r[0-9]*.txt
+run[0-9]*.txt

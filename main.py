@@ -25,6 +25,11 @@ from position_monitor import PositionMonitor
 from signal_queue import SignalQueue, SignalResult
 from execution_guard import ExecutionGuard, ExecutionUncertain, PreflightFailure
 
+# spot / entry_price. A healthy fill sits near 0.89 at 10% slippage; the two
+# fills that cost $98.63 in one morning came in at 0.033 and 0.001 -- 97% and
+# 100% price impact. 0.70 (30% impact) separates them with room to spare.
+MIN_ENTRY_QUALITY = float(os.getenv("MIN_ENTRY_QUALITY", "0.70"))
+
 
 class CopyTraderBot:
     def __init__(self, paper=False, no_telegram=False):
@@ -325,11 +330,24 @@ class CopyTraderBot:
                               contract_address=position.contract_address,
                               spot_over_entry=round(ratio, 4),
                               stake_usd=position.stake_usd)
-                    if ratio < 0.70:
-                        self.logger.warning(
+                    if ratio < MIN_ENTRY_QUALITY:
+                        # Warning alone was not enough. Two fills at 97% and 100%
+                        # price impact were correctly identified and then held to
+                        # a total loss anyway -- $98.63 of a $221 losing run. A
+                        # fill this bad is already the loss; the only question is
+                        # whether we sit in it. Exit on the monitor's next tick.
+                        self.logger.critical(
                             f"THIN POOL {position.ticker}: filled at {1/ratio:.1f}x spot "
                             f"({(1-ratio)*100:.0f}% impact on ${position.stake_usd:.2f}). "
-                            f"Not tradeable at this size.")
+                            f"Not tradeable at this size -- exiting immediately.")
+                        log_event("thin_pool_exit", ticker=position.ticker,
+                                  contract_address=position.contract_address,
+                                  spot_over_entry=round(ratio, 5),
+                                  impact_pct=round((1 - ratio) * 100, 1),
+                                  stake_usd=position.stake_usd)
+                        position.pending_exit = dict(
+                            rung="CLOSE", reason="thin pool; fill impact unrecoverable",
+                            multiplier=ratio, tokens=position.remaining_tokens)
                     elif ratio > 2.0:
                         # A fill BETTER than spot is not luck, it is a measurement
                         # error -- the fill was quoted against a different pool

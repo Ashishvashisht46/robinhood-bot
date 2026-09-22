@@ -54,7 +54,11 @@ from models import CallSignal
 logger = logging.getLogger("copytrader")
 
 ENABLED = os.getenv("LAUNCH_WATCHER_ENABLED", "false").lower() == "true"
-MIN_HOLDERS = int(os.getenv("WATCH_MIN_HOLDERS", "300"))
+# The channel's FLOOR is 20 holders; their MEDIAN is 128. Running at the floor
+# buys the worst slice of what they would ever touch, and it showed: 9 watcher
+# trades at >=20 went 0 wins, -$18.63 each even on clean fills. The floors below
+# are the right shape for a hard reject; they are the wrong place to sit.
+MIN_HOLDERS = int(os.getenv("WATCH_MIN_HOLDERS", "128"))
 AGE_MINUTES = float(os.getenv("WATCH_AGE_MINUTES", "4"))
 POLL_SECONDS = float(os.getenv("WATCH_POLL_SECONDS", "20"))
 MAX_PER_HOUR = int(os.getenv("WATCH_MAX_PER_HOUR", "4"))
@@ -350,7 +354,9 @@ def self_test() -> int:
 
     print("\ndefaults are the safe ones:")
     check("watcher OFF unless explicitly enabled", ENABLED, False)
-    check("threshold is the measured one", MIN_HOLDERS, 300)
+    # Their median, not their floor. Running at the floor (20) went 0 wins from
+    # 9 trades at -$18.63 each, on clean fills.
+    check("threshold is the channel's MEDIAN holders", MIN_HOLDERS, 128)
 
     print()
     if fails:
