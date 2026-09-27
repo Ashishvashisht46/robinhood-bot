@@ -38,3 +38,7 @@ AUDIT_REPORT.md
 # scratch log extracts
 r[0-9]*.txt
 run[0-9]*.txt
+
+# trade-log exports: personal financial records, never committed
+exports/
+*.xlsx
