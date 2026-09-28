@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import math
+import time
 from datetime import datetime, timezone
 from typing import Dict, Any, Callable, Optional
 
@@ -13,6 +14,9 @@ logger = logging.getLogger("copytrader")
 # One absurd price reading is a bad tick. A RUN of them means the entry price is
 # wrong, not the feed, and the position has no working stop until someone notices.
 OUTLIER_STREAK_LIMIT = 5
+# Paper only: how long a sale may stay impossible before it is booked at zero.
+# Long enough to ride out an RPC outage; a rug never comes back.
+UNSELLABLE_WRITE_OFF_SECONDS = 300
 
 
 class PositionMonitor:
@@ -22,6 +26,8 @@ class PositionMonitor:
         self.on_position_closed, self.on_position_changed = on_position_closed, on_position_changed
         self._tasks: Dict[str, asyncio.Task] = {}
         self._outlier_streak: Dict[str, int] = {}
+        self._unsellable_since: Dict[str, float] = {}
+        self._last_priced: Dict[str, float] = {}
         self._stopping = False
 
     def _persist(self, position):
@@ -90,14 +96,15 @@ class PositionMonitor:
                 if guard:
                     operation = guard.last_operation
             if not math.isfinite(sold) or sold <= 0:
-                return False
+                return await self._exit_failed(position)
         except ExecutionUncertain as exc:
             logger.error("Exit for $%s requires reconciliation: %s", position.ticker, exc)
             return False
         except Exception as exc:
             logger.warning("Exit for $%s failed before a verified fill: %s", position.ticker, exc)
-            return False
+            return await self._exit_failed(position)
 
+        self._unsellable_since.pop(position.id, None)
         sold = min(float(sold), position.remaining_tokens)
         ratio = sold / position.tokens_bought
         pnl = (multiplier - 1.0) * position.stake_usd * ratio
@@ -149,6 +156,32 @@ class PositionMonitor:
             return True
         return False
 
+    async def _exit_failed(self, position):
+        """
+        Live keeps retrying a failed exit: the tokens are real and may yet sell.
+        Paper books a sale that stays impossible as the loss it would be -- the
+        paper sell is quoted, so a pulled pool fails every attempt.
+        """
+        if not self.config.DRY_RUN:
+            return False
+        since = self._unsellable_since.setdefault(position.id, time.time())
+        # Only while the chain answers: the pool is readable and still refuses the
+        # sale. An RPC outage fails the price read too, and writes nothing off.
+        if (time.time() - since < UNSELLABLE_WRITE_OFF_SECONDS
+                or time.time() - self._last_priced.get(position.id, 0) > 30):
+            return False
+        loss = position.stake_usd * position.remaining_tokens / position.tokens_bought
+        logger.critical("UNSELLABLE $%s: no sell route for %.0fs. Paper position written off: -$%.2f",
+                        position.ticker, time.time() - since, loss)
+        log_event("paper_write_off", position_id=position.id, ticker=position.ticker,
+                  contract_address=position.contract_address,
+                  remaining_tokens=position.remaining_tokens, pnl_usd=-loss)
+        position.accumulated_pnl_usd -= loss
+        position.remaining_tokens, position.pending_exit = 0.0, None
+        self._unsellable_since.pop(position.id, None)
+        await self._close(position, "unsellable: no sell route", 0.0)
+        return True
+
     async def _tick(self, position):
         guard = self.dex_trader if hasattr(self.dex_trader, "operations") else None
         if guard:
@@ -168,6 +201,7 @@ class PositionMonitor:
                 # not prevent a later stop from closing the whole position.
                 fresh = await self.dex_trader.get_token_price_eth(position.contract_address)
                 if math.isfinite(fresh) and fresh > 0 and position.entry_price_eth > 0:
+                    self._last_priced[position.id] = time.time()
                     multiplier = fresh / position.entry_price_eth
                     position.pending_exit["multiplier"] = multiplier
                     if multiplier <= position.trailing_stop_multiplier:
@@ -188,6 +222,7 @@ class PositionMonitor:
             return False
         if not math.isfinite(position.entry_price_eth) or position.entry_price_eth <= 0 or position.tokens_bought <= 0:
             raise ValueError("invalid entry measurement; refusing to invent an entry price")
+        self._last_priced[position.id] = time.time()
         multiplier = price / position.entry_price_eth
         if multiplier > 50 * max(1.0, position.peak_multiplier):
             # Observed live: 1,717 consecutive rejections over 110 minutes while

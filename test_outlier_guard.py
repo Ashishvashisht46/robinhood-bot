@@ -73,6 +73,7 @@ def build(price_source):
     from position_monitor import PositionMonitor
     mon = PositionMonitor.__new__(PositionMonitor)
     mon._outlier_streak = {}
+    mon._last_priced = {}
     mon._stopping = False
     mon.config = Cfg()
     mon._persist = lambda position: None

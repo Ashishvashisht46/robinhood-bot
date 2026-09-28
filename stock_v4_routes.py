@@ -7,6 +7,7 @@ from execution_guard import ExecutionUncertain, PreflightFailure
 # Uses V2 Router for V2
 
 import logging
+import threading
 import time
 import requests
 import eth_abi
@@ -214,13 +215,107 @@ _V4_PARAM_CACHE = {
 }
 
 
+V4_POOL_MANAGER = "0x8366a39CC670B4001A1121B8F6A443A643e40951"
+# The bot's QuickNode endpoint refuses eth_getLogs (HTTP error); Robinhood's
+# official RPC serves it, given a browser User-Agent.
+LOGS_RPC = "https://rpc.mainnet.chain.robinhood.com"
+LOGS_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+_http = threading.local()
+
+
+def _logs_rpc(method, params):
+    # A kept-alive session per worker thread: a fresh TLS handshake made each
+    # call ~800 ms from here instead of ~330 ms (measured 2026-09-28).
+    if not hasattr(_http, "session"):
+        _http.session = requests.Session()
+    r = _http.session.post(LOGS_RPC, timeout=5, headers={"User-Agent": LOGS_UA},
+                           json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).json()
+    if "error" in r:
+        raise RuntimeError(f"{method}: {r['error']}")
+    return r["result"]
+
+
 def resolve_v4_pool_params(w3, pool_id: str, pair_created_at_ms: int = 0):
+    """
+    The exact PoolKey (currencies, fee, tick spacing, hook) of a V4 pool, from
+    its Initialize event -- the only on-chain record of a key, since the
+    PoolManager stores pools by id.
+
+    This used to read only the hardcoded cache above and return None for any new
+    pool, so every caller fell back to guessing keys. 81% of the 8,292 V4 pools
+    created on 2026-09-28 use a key no guess list covers; three Telegram calls
+    in two hours expired unquoted that way (fee 500 / tick spacing 1).
+    """
     if not pool_id or len(pool_id) != 66:
         return None
     pool_id = pool_id.lower()
     if pool_id in _V4_PARAM_CACHE:
         return _V4_PARAM_CACHE[pool_id]
-    return None
+    if w3 is None:
+        return None
+    try:
+        head = w3.eth.block_number
+        if pair_created_at_ms:
+            ago_blocks = int(max(0.0, time.time() - pair_created_at_ms / 1000) / 0.1007)
+            lo, hi = max(0, head - ago_blocks - 30_000), min(head, head - ago_blocks + 30_000)
+        else:
+            lo, hi = max(0, head - 900_000), head            # ~25h
+        logs = _logs_rpc("eth_getLogs", [{"fromBlock": hex(lo), "toBlock": hex(hi), "address": V4_POOL_MANAGER,
+                                          "topics": [INIT_TOPIC, pool_id]}])
+    except Exception as exc:
+        logger.debug(f"V4 key lookup failed for pool {pool_id}: {exc}")
+        return None                       # not cached: a later call retries it
+    if not logs:
+        return None
+    d, t = logs[0]["data"][2:], logs[0]["topics"]
+    params = {"c0": _cs("0x" + t[2][-40:]), "c1": _cs("0x" + t[3][-40:]),
+              "fee": int(d[0:64], 16), "tick": int(d[64:128], 16),
+              "hook": _cs("0x" + d[128:192][-40:]), "block": int(logs[0]["blockNumber"], 16)}
+    _V4_PARAM_CACHE[pool_id] = params
+    return params
+
+
+V4_POSITION_MANAGER = "0x58daec3116aae6D93017bAAea7749052E8a04fA7"
+MODIFY_TOPIC = "0xf208f4912782fd25c7f114ca3723a2d5dd6f3bcc3ac8db5af63baa85f711d5ec"
+BURN_ADDRESSES = {ZERO.lower(), "0x000000000000000000000000000000000000dead"}
+
+
+def wallet_held_liquidity(pool_id: str, from_block: int = 0):
+    """
+    The wallet that holds most of a V4 pool's liquidity and can pull it at will,
+    or None. A position minted through the PositionManager is an NFT, and whoever
+    owns it can withdraw. A launchpad or hook that adds liquidity itself keeps it
+    in a contract. All five calls that expired on 2026-09-28 were pools whose
+    only NFT sat in the creator's wallet. Each was emptied 6-8 minutes after
+    launch, between 16 s before and 80 s after the call.
+
+    Raises when it cannot tell, and the caller decides what an unknown means.
+    """
+    if not from_block:
+        from_block = max(0, int(_logs_rpc("eth_blockNumber", []), 16) - 900_000)   # ~25h
+    live = {}                                   # (sender, salt) -> liquidity still in
+    for log in _logs_rpc("eth_getLogs", [{"fromBlock": hex(from_block), "toBlock": "latest",
+                                          "address": V4_POOL_MANAGER, "topics": [MODIFY_TOPIC, pool_id]}]):
+        d = log["data"][2:]
+        delta = int(d[128:192], 16)
+        delta -= (1 << 256) if delta >> 255 else 0
+        key = ("0x" + log["topics"][2][-40:], d[192:256])
+        live[key] = live.get(key, 0) + delta
+    live = {k: v for k, v in live.items() if v > 0}
+    if not live:
+        return None                             # nothing left to pull; the quote says so
+    (sender, salt), top = max(live.items(), key=lambda kv: kv[1])
+    # ponytail: liquidity units in different tick ranges are not equal in value, so
+    # the largest L stands in for the largest holder. If mixed-range pools ever fool
+    # it, value each position in tokens at the current price instead.
+    if sender.lower() != V4_POSITION_MANAGER.lower() or top * 2 <= sum(live.values()):
+        return None
+    owner = _logs_rpc("eth_call", [{"to": V4_POSITION_MANAGER,
+                                    "data": "0x6352211e" + salt}, "latest"])     # ownerOf(tokenId)
+    owner = "0x" + owner[-40:]
+    if owner.lower() in BURN_ADDRESSES:
+        return None
+    return _cs(owner) if _logs_rpc("eth_getCode", [owner, "latest"]) in ("0x", "") else None
 
 
 def map_ds_pair(token: str, p: dict, w3=None):
@@ -252,7 +347,8 @@ def map_ds_pair(token: str, p: dict, w3=None):
         hook = v4_params["hook"] if v4_params else PONS_HOOK
         if v4_params:
             quote_resolved = v4_params["c0"] if v4_params["c0"].lower() != token else v4_params["c1"]
-            return {"venue": "UNISWAP_V4", "quote": quote_resolved, "fee": fee, "tick": tick, "hook": hook, "target": UNIVERSAL_ROUTER, "ds": True}
+            return {"venue": "UNISWAP_V4", "quote": quote_resolved, "fee": fee, "tick": tick, "hook": hook, "target": UNIVERSAL_ROUTER, "ds": True,
+                    "onchain_key": True}
         
         quote_addr = NATIVE if quote_sym in ("ETH", "WETH") or q.lower() in (NATIVE.lower(), WETH.lower()) else q
         return {"venue": "UNISWAP_V4", "quote": quote_addr, "fee": fee, "tick": tick, "hook": hook, "target": UNIVERSAL_ROUTER, "ds": True}

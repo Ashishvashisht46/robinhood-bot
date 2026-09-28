@@ -2,7 +2,7 @@ import os
 import sys
 import json
 import logging
-from execution_guard import ExecutionUncertain, PreflightFailure
+from execution_guard import ExecutionUncertain, PreflightFailure, RugRisk
 import asyncio
 from chain_client import eip1559_fees
 import re
@@ -31,6 +31,8 @@ from stock_v4_routes import (
     map_ds_pair,
     pool_id_from_key,
     encode_v3_path,
+    resolve_v4_pool_params,
+    wallet_held_liquidity,
 )
 
 def dex_family(label: Optional[str]) -> Optional[str]:
@@ -715,6 +717,34 @@ class DexTrader:
         cached = self._v4_pool_params_cache.get(self.w3.to_checksum_address(token_address), {})
         return cached.get("quote") or fallback
 
+    async def rug_risk(self, token_cs: str, venue: str, quote: str) -> Optional[str]:
+        """
+        Why this buy's pool can be pulled out from under it, or None.
+
+        Uniswap V4 only, because every rug seen so far was a plain V4 pool whose
+        liquidity NFT sat in the creator's wallet. It takes the route the buy just
+        detected, so it costs one log query and two view calls on V4 buys only.
+        It raises when it cannot tell.
+        """
+        if venue != "UNISWAP_V4":
+            return None
+        key = self._v4_pool_params_cache.get(token_cs, {})
+        # ponytail: only a verified key names the pool without a key scan, so a V4
+        # pool the bot finds only by scanning is bought unchecked. Scanning here as
+        # well would double the 90 s scan that blocked PANS. Every rug so far had a
+        # chain-read (verified) key.
+        # Pons graduation liquidity is minted to a Pons contract. That held for
+        # OMNIBIND and for both Pons pools in a 533-pool sample, and checking
+        # OMNIBIND's took 2.3 s of the buy.
+        if not key.get("verified") or str(key["hook"]).lower() == PONS_V2_HOOK.lower():
+            return None
+        c0, c1 = sorted((token_cs, self.w3.to_checksum_address(key.get("quote") or quote)),
+                        key=lambda a: int(a, 16))
+        pool_id = "0x" + pool_id_from_key(c0, c1, key["fee"], key["tick"], key["hook"]).hex()
+        created = (resolve_v4_pool_params(None, pool_id) or {}).get("block", 0)
+        owner = await asyncio.to_thread(wallet_held_liquidity, pool_id, created)
+        return f"rug risk: wallet {owner} holds this pool's liquidity and can pull it" if owner else None
+
     def _remember_v4_key(self, token_cs: str, quote_asset: str, fee: int, tick: int, hook: str) -> None:
         self._v4_pool_params_cache[token_cs] = {
             "tick": int(tick), "hook": hook, "fee": int(fee),
@@ -947,11 +977,19 @@ class DexTrader:
         try:
             ds_pair = await ds_task
             if ds_pair:
-                mapped = map_ds_pair(token_cs, ds_pair, self.w3)
+                # In a thread: resolving a new V4 key is a network call, and
+                # this runs on the event loop the Telegram listener shares.
+                mapped = await asyncio.to_thread(map_ds_pair, token_cs, ds_pair, self.w3)
                 if mapped.get("venue") != "NONE":
+                    if mapped.get("onchain_key") and mapped["quote"].lower() in (ZERO.lower(), self.weth_address.lower()):
+                        # Read from the pool's own Initialize event, so it IS the
+                        # pool: no liquidity check needed. That check sent a pulled
+                        # pool into a 90 s key scan, and PANS waited 94 s behind it.
+                        # Other quotes keep _v4_params_for's native-pool preference.
+                        self._remember_v4_key(token_cs, mapped["quote"], mapped["fee"], mapped["tick"], mapped["hook"])
                     # Cache V4 pool params (tick, hook) so buy_token/sell_token
                     # can use the real values instead of hardcoded defaults
-                    if "tick" in mapped or "hook" in mapped:
+                    elif "tick" in mapped or "hook" in mapped:
                         self._v4_pool_params_cache[token_cs] = {
                             "tick": mapped.get("tick", 200),
                             "hook": mapped.get("hook", PONS_V2_HOOK),
@@ -1545,6 +1583,17 @@ class DexTrader:
         logger.info(f"🔎 Token: {token_address} | Venue: {venue} | Target: {target_addr} | QuoteAsset: {quote_asset} | Fee: {fee} | Detection time: {t_detect - start_time:.2f}s")
         print(f"🔎 Token: {token_address} | Venue: {venue} | Target: {target_addr} | QuoteAsset: {quote_asset} | Fee: {fee}")
 
+        # Before any quote or paper fill. All five calls that expired on 2026-09-28
+        # were V4 pools whose creator held the liquidity and pulled it within 80 s.
+        try:
+            risk = await self.rug_risk(token_address, venue, quote_asset)
+        except (ExecutionUncertain, PreflightFailure):
+            raise
+        except Exception as exc:
+            raise PreflightFailure(f"rug check unavailable: {type(exc).__name__}") from exc
+        if risk:
+            raise RugRisk(risk)
+
         if venue == "NONE":
             info = {}
             try:
@@ -2033,6 +2082,17 @@ class DexTrader:
         print(f"Detected Venue: {venue}")
 
         if getattr(self.config, "DRY_RUN", True):
+            # Quoted like a paper entry (_dry_run_fill): a pool that cannot take the
+            # sale is a failed exit, not a fill at the last price. A pulled V4 pool
+            # keeps its old price in slot0, so the paper book closed rugs near
+            # breakeven. position_monitor writes off a sale that stays impossible.
+            decimals = await self.chain.get_token_decimals(token_address)
+            expected = await asyncio.to_thread(
+                self._quote_route, venue, token_address, quote_asset, fee,
+                int(token_amount * 10**decimals), target_addr, True)
+            if not expected or expected <= 0:
+                logger.warning(f"[DRY RUN] No sell quote for {token_address}; refusing to invent an exit")
+                return "", 0.0
             logger.info(f"[DRY RUN] Would sell {token_amount} of {token_address} on venue {venue}")
             print(f"⚡ [DRY RUN] Would sell {token_amount} of {token_address} on venue {venue}")
             return f"DRY_RUN_SELL_0x{int(time.time())}", token_amount

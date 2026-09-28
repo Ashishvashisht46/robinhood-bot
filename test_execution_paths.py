@@ -83,6 +83,31 @@ class SenderTests(unittest.IsolatedAsyncioTestCase):
         dex._quote_route.return_value = None
         self.assertEqual(await dex._dry_run_fill("token", 0.001), 0)
 
+    async def test_paper_exit_needs_a_sell_quote(self):
+        # A pulled V4 pool keeps its old price, so only a quote shows it cannot sell.
+        dex = object.__new__(DexTrader)
+        dex.config = SimpleNamespace(DRY_RUN=True)
+        dex.chain = SimpleNamespace(w3=SimpleNamespace(to_checksum_address=lambda a: a), account=None,
+                                    get_token_decimals=AsyncMock(return_value=18))
+        dex.verify_chain_id = AsyncMock()
+        dex.detect_venue_and_route = AsyncMock(return_value=("UNISWAP_V4", "router", "0x" + "0" * 40, 500))
+        dex._quote_route = Mock(return_value=None)
+        self.assertEqual(await dex.sell_token("token", 5.0), ("", 0.0))
+        self.assertEqual(dex._quote_route.call_args.args[4:], (5 * 10**18, "router", True))
+        dex._quote_route.return_value = 10**15
+        self.assertEqual((await dex.sell_token("token", 5.0))[1], 5.0)
+
+    async def test_buys_read_the_warm_price_and_only_the_refresh_asks(self):
+        import time as _time
+        chain = object.__new__(ChainClient)
+        chain._eth_price_usd, chain._eth_price_timestamp, chain._price_cache_ttl = 2500.0, _time.time(), 60
+        session = Mock(side_effect=OSError("offline"))
+        with patch("chain_client.aiohttp.ClientSession", session):
+            self.assertEqual(await chain.get_eth_price_usd(), 2500.0)
+            session.assert_not_called()
+            self.assertEqual(await chain.get_eth_price_usd(refresh=True), 2500.0)
+        self.assertEqual(session.call_count, 3)          # every source was asked
+
     async def test_guarded_unreadable_fill_cannot_fall_through_to_second_buy(self):
         dex = object.__new__(DexTrader)
         dex.chain = SimpleNamespace(execution_guard=object())
@@ -153,6 +178,44 @@ class LatencyTests(unittest.IsolatedAsyncioTestCase):
             venue, *_ = await dex._detect_venue_and_route_uncached(self.TOKEN, "uni_v4")
         self.assertEqual(venue, "UNISWAP_V3_WETH")
         dex.resolve_token_curve.assert_not_awaited()
+
+    async def test_chain_read_v4_key_is_trusted_without_a_liquidity_check(self):
+        # A pulled pool has no in-range liquidity, and checking for it sent the buy
+        # into a 90 s key scan (PANS waited 94 s behind one). The Initialize event
+        # already proves the key. A USDG-quoted key keeps the native-pool preference.
+        dex = self.trader()
+        dex.is_contract = AsyncMock(return_value=True)
+        dex.resolve_token_curve = AsyncMock()
+        dex._v4_pool_params_cache = {}
+        mapped = {"venue": "UNISWAP_V4", "target": dex.uni_router_address, "quote": self.ZERO,
+                  "fee": 500, "tick": 1, "hook": self.ZERO, "onchain_key": True}
+        other = "0x" + "8" * 40
+        with patch("dex_trader.fetch_dexscreener", return_value={"stub": True}), \
+             patch("dex_trader.map_ds_pair", side_effect=[mapped, dict(mapped, quote=dex.usdg_address)]):
+            await dex._detect_venue_and_route_uncached(self.TOKEN, "Uniswap V4")
+            await dex._detect_venue_and_route_uncached(other, "Uniswap V4")
+        dex._v4_key_is_live = Mock(side_effect=AssertionError("liquidity check"))
+        dex.stock_v4 = SimpleNamespace(probe_v4_key=Mock(side_effect=AssertionError("key scan")))
+        self.assertEqual(dex._v4_params_for(self.TOKEN, self.ZERO, 500), (500, 1, self.ZERO))
+        self.assertNotIn("verified", dex._v4_pool_params_cache[dex.w3.to_checksum_address(other)])
+
+    async def test_buy_refuses_a_pool_its_creator_can_empty(self):
+        from execution_guard import RugRisk
+        dex = self.trader()
+        dex.config = SimpleNamespace(DRY_RUN=True)
+        dex.chain = SimpleNamespace(account=None)
+        dex.detect_venue_and_route = AsyncMock(return_value=("UNISWAP_V4", dex.uni_router_address, self.ZERO, 500))
+        dex._v4_pool_params_cache = {}
+        dex._remember_v4_key(dex.w3.to_checksum_address(self.TOKEN), self.ZERO, 500, 1, self.ZERO)
+        dex._dry_run_fill = AsyncMock(return_value=1.0)
+        with patch("dex_trader.wallet_held_liquidity", return_value="0x" + "5" * 40) as held:
+            with self.assertRaises(RugRisk):
+                await dex.buy_token(self.TOKEN, 0.001, 5)
+        dex._dry_run_fill.assert_not_awaited()                    # not even a paper fill
+        pool = stock_v4_routes.pool_id_from_key(self.ZERO, self.TOKEN, 500, 1, self.ZERO)
+        self.assertEqual(held.call_args.args[0], "0x" + pool.hex())
+        with patch("dex_trader.wallet_held_liquidity", return_value=None):
+            self.assertEqual((await dex.buy_token(self.TOKEN, 0.001, 5))[1], 1.0)
 
     async def test_curve_timeout_is_not_cached_but_a_revert_is(self):
         import time as _time
@@ -362,6 +425,55 @@ class StockRouteTests(unittest.TestCase):
         router.sell_v3_path = Mock(side_effect=RuntimeError("no liquidity"))
         router._unwind_stock("0x" + "5" * 40, 1000, ("v3", ["a", "b"], [500]), "x")
         router.sell_v3_path.assert_called_once()
+
+    def test_unlisted_v4_key_is_read_from_its_initialize_event(self):
+        # fee 500 / tick spacing 1 is on no guess list; three calls expired on it.
+        token, pool, word = "0x94cD74fa92bD07b763796d3Dfc0835beE66a3093", "0x" + "ab" * 32, "{:064x}".format
+        log = {"topics": [stock_v4_routes.INIT_TOPIC, pool, "0x" + "0" * 64, "0x" + "0" * 24 + token[2:].lower()],
+               "data": "0x" + word(500) + word(1) + word(0) + word(2**96) + word(0), "blockNumber": hex(9_999_000)}
+        rpc = Mock(return_value=[log])
+        w3 = SimpleNamespace(eth=SimpleNamespace(block_number=10_000_000))
+        pair = {"dexId": "uniswap", "labels": ["v4"], "pairAddress": pool, "liquidity": {"usd": 5000},
+                "baseToken": {"address": token}, "quoteToken": {"address": stock_v4_routes.ZERO, "symbol": "ETH"}}
+        with patch("stock_v4_routes._logs_rpc", rpc), patch.dict(stock_v4_routes._V4_PARAM_CACHE):
+            first = stock_v4_routes.map_ds_pair(token, pair, w3)
+            stock_v4_routes.map_ds_pair(token, pair, w3)
+            created = stock_v4_routes.resolve_v4_pool_params(w3, pool)["block"]
+        self.assertEqual((first["venue"], first["fee"], first["tick"], first["hook"], first["quote"]),
+                         ("UNISWAP_V4", 500, 1, stock_v4_routes.ZERO, stock_v4_routes.ZERO))
+        self.assertTrue(first["onchain_key"])
+        self.assertEqual(created, 9_999_000)
+        self.assertEqual(rpc.call_args.args[1][0]["topics"], [stock_v4_routes.INIT_TOPIC, pool])
+        self.assertEqual(rpc.call_count, 1)                 # later calls are served from cache
+
+    def lp_logs(self, *positions):
+        """ModifyLiquidity logs for (sender, token_id, liquidity delta) triples."""
+        word = lambda n: f"{n % (1 << 256):064x}"                    # noqa: E731
+        return [{"topics": [stock_v4_routes.MODIFY_TOPIC, "0x" + "ab" * 32, "0x" + "0" * 24 + sender[2:]],
+                 "data": "0x" + word(-600) + word(600) + word(delta) + word(token_id)}
+                for sender, token_id, delta in positions]
+
+    def held_by(self, logs, owner="0x" + "5" * 40, code="0x"):
+        answers = {"eth_getLogs": logs, "eth_call": "0x" + "0" * 24 + owner[2:], "eth_getCode": code}
+        with patch("stock_v4_routes._logs_rpc", side_effect=lambda m, p: answers[m]):
+            return stock_v4_routes.wallet_held_liquidity("0x" + "ab" * 32, 123)
+
+    def test_liquidity_nft_in_a_wallet_is_a_rug_risk(self):
+        pm, hook = stock_v4_routes.V4_POSITION_MANAGER.lower(), "0x" + "9" * 40
+        self.assertEqual(self.held_by(self.lp_logs((pm, 7, 10**20))), "0x" + "5" * 40)
+        self.assertIsNone(self.held_by(self.lp_logs((pm, 7, 10**20)), code="0x6080"))    # a locker
+        self.assertIsNone(self.held_by(self.lp_logs((pm, 7, 10**20)), owner="0x" + "0" * 36 + "dead"))
+        self.assertIsNone(self.held_by(self.lp_logs((pm, 7, 10**20), (pm, 7, -10**20))))  # already pulled
+        self.assertIsNone(self.held_by(self.lp_logs((hook, 7, 10**20))))                  # hook/launchpad
+        self.assertIsNone(self.held_by(self.lp_logs((pm, 7, 10**20), (hook, 8, 3 * 10**20))))  # minority
+        self.assertIsNone(self.held_by(self.lp_logs((pm, 7, 4), (hook, 8, 3), ("0x" + "8" * 40, 9, 3))))
+
+    def test_failed_v4_key_lookup_is_not_cached(self):
+        pool, w3 = "0x" + "cd" * 32, SimpleNamespace(eth=SimpleNamespace(block_number=10_000_000))
+        with patch("stock_v4_routes._logs_rpc", Mock(side_effect=TimeoutError("slow"))), \
+                patch.dict(stock_v4_routes._V4_PARAM_CACHE):
+            self.assertIsNone(stock_v4_routes.resolve_v4_pool_params(w3, pool))
+            self.assertNotIn(pool, stock_v4_routes._V4_PARAM_CACHE)
 
     def test_fee_ceiling_covers_base_and_tip(self):
         w3 = SimpleNamespace(eth=SimpleNamespace(get_block=lambda _: {"baseFeePerGas": 10**9}))

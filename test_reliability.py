@@ -264,6 +264,15 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             await self.guard.buy_token(TOKEN, 0.001, 5)
         self.assertEqual(self.guard.operations, {})
 
+    async def test_rug_risk_reaches_the_caller_unwrapped(self):
+        # main maps RugRisk to "rejected"; wrapped as a plain PreflightFailure it
+        # would be retried until the call expired.
+        from execution_guard import RugRisk
+        self.dex.buy_token.side_effect = RugRisk("rug risk: wallet 0x1 holds this pool's liquidity")
+        with self.assertRaises(RugRisk):
+            await self.guard.buy_token(TOKEN, 0.001, 5)
+        self.assertEqual(self.guard.operations, {})
+
     async def test_success_stays_journaled_until_position_persisted(self):
         await self.guard.buy_token(TOKEN, 0.001, 5)
         operation = self.guard.last_operation
@@ -403,6 +412,42 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
         self.dex.get_token_price_eth.return_value = p.entry_price_eth * 0.4
         await self.monitor._tick(p)
         self.dex.sell_token.assert_awaited_once()
+
+    async def test_paper_sale_that_stays_impossible_is_written_off(self):
+        from position_monitor import UNSELLABLE_WRITE_OFF_SECONDS
+        p = position()
+        self.dex.get_token_price_eth.return_value = p.entry_price_eth * 0.4   # the stop fires
+        self.dex.sell_token.return_value = ("", 0)                            # no sell route
+        self.assertFalse(await self.monitor._tick(p))                          # could be an outage
+        self.monitor._unsellable_since[p.id] -= UNSELLABLE_WRITE_OFF_SECONDS
+        self.assertTrue(await self.monitor._tick(p))
+        self.assertAlmostEqual(p.pnl_usd, -10)                                 # the whole stake
+        self.assertEqual(p.remaining_tokens, 0)
+        self.closed.assert_awaited_once()
+
+    async def test_live_sale_is_never_written_off(self):
+        p = position()
+        self.cfg.DRY_RUN = False
+        self.dex.get_token_price_eth.return_value = p.entry_price_eth * 0.4
+        self.dex.sell_token.return_value = ("", 0)
+        self.monitor._unsellable_since[p.id] = 0.0                             # failing "forever"
+        self.assertFalse(await self.monitor._tick(p))
+        self.assertEqual(p.remaining_tokens, 100)
+        self.closed.assert_not_awaited()
+
+    async def test_rpc_outage_writes_nothing_off(self):
+        # Price reads fail too, so it is the chain that is down, not the pool.
+        from position_monitor import UNSELLABLE_WRITE_OFF_SECONDS
+        p = position()
+        self.dex.get_token_price_eth.return_value = p.entry_price_eth * 0.4
+        self.dex.sell_token.return_value = ("", 0)
+        await self.monitor._tick(p)
+        self.monitor._unsellable_since[p.id] -= UNSELLABLE_WRITE_OFF_SECONDS
+        self.monitor._last_priced[p.id] -= 60
+        self.dex.get_token_price_eth.return_value = float("nan")
+        self.assertFalse(await self.monitor._tick(p))
+        self.assertEqual(p.remaining_tokens, 100)
+        self.closed.assert_not_awaited()
 
     async def test_failed_profit_exit_does_not_mask_later_stop(self):
         p = position()

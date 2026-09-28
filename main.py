@@ -23,7 +23,7 @@ from dex_trader import DexTrader
 from strategy_engine import StrategyEngine
 from position_monitor import PositionMonitor
 from signal_queue import SignalQueue, SignalResult
-from execution_guard import ExecutionGuard, ExecutionUncertain, PreflightFailure
+from execution_guard import ExecutionGuard, ExecutionUncertain, PreflightFailure, RugRisk
 
 # spot / entry_price. A healthy fill sits near 0.89 at 10% slippage; the two
 # fills that cost $98.63 in one morning came in at 0.033 and 0.001 -- 97% and
@@ -38,15 +38,23 @@ class CopyTraderBot:
         if paper:
             self.config.DRY_RUN = True
             self.config.BUY_EVERY_SIGNAL = True
-            # Paper-only stake override. Set AFTER Config() on purpose: config
-            # calls load_dotenv(override=True), so .env beats the shell
-            # environment and a plain BASELINE_STAKE_USD=50 is silently ignored.
-            # Editing .env instead would risk leaving a $50 stake configured
-            # against a $6.79 wallet if the run died.
-            paper_stake = os.getenv("PAPER_STAKE_USD")
-            if paper_stake:
-                self.config.BASELINE_STAKE_USD = float(paper_stake)
-                self.config.COMPOUND_STAKE_USD = float(paper_stake)
+            # Paper-only overrides. Set AFTER Config() on purpose: config calls
+            # load_dotenv(override=True), so .env beats the shell environment and
+            # a plain BASELINE_STAKE_USD=50 is silently ignored. Editing .env
+            # instead would risk leaving a $50 stake configured against a $6.79
+            # wallet if the run died.
+            #
+            # Paper exists to measure the strategy on EVERY call, so the limits
+            # that protect a small live wallet are lifted here: they were the
+            # reason paper calls expired unbought ("Max concurrent positions").
+            stake = float(os.getenv("PAPER_STAKE_USD") or 50)
+            self.config.BASELINE_STAKE_USD = self.config.COMPOUND_STAKE_USD = stake
+            self.config.MAX_CONCURRENT_POSITIONS = 10_000
+            self.config.SAFETY_FLOOR_USD = self.config.GAS_RESERVE_USD = 0.0
+            self.config.MAX_DAILY_LOSS_USD, self.config.MAX_CONSECUTIVE_LOSSES = 0.0, 0   # 0 = off
+        # The pretend wallet: topped up to this at every paper start, so a losing
+        # run never runs out of money. Paper P&L is the ledger's, not this balance.
+        paper_capital = float(os.getenv("PAPER_CAPITAL_USD") or 10_000) if paper else None
         log_dir = os.path.join(self.config.BASE_DIR, "logs", "paper") if self.config.DRY_RUN else os.path.join(self.config.BASE_DIR, "logs")
         setup_logging(log_dir)
         configure_ledger(os.path.join(log_dir, "events.jsonl"))
@@ -62,6 +70,11 @@ class CopyTraderBot:
         self.chain_client = ChainClient(self.config)
         self.dex_trader = DexTrader(self.chain_client, self.config)
         self.strategy_engine = StrategyEngine(self.config)
+        if paper_capital and self.strategy_engine.balance_usd < paper_capital:
+            self.logger.info(f"Paper wallet topped up: ${self.strategy_engine.balance_usd:,.2f} "
+                             f"-> ${paper_capital:,.2f}")
+            self.strategy_engine.balance_usd = paper_capital
+            self.strategy_engine.save()
         self.execution = ExecutionGuard(self.config, self.chain_client, self.dex_trader)
         self.execution.inventory_exclusions = lambda: {
             p.contract_address for p in self.strategy_engine.open_positions
@@ -75,7 +88,7 @@ class CopyTraderBot:
         # Second signal source, off unless LAUNCH_WATCHER_ENABLED=true. Feeds the
         # same queue, so every gate, stake rule and exit ladder applies unchanged.
         self.launch_watcher = LaunchWatcher(self.config, self.enqueue_signal)
-        self._recovery_task = None
+        self._recovery_task = self._price_task = None
 
     async def start(self):
         banner = (
@@ -120,6 +133,7 @@ class CopyTraderBot:
         await self.recover_open_positions()
         self.signal_queue.start()
         self._recovery_task = asyncio.create_task(self._recovery_loop())
+        self._price_task = asyncio.create_task(self._eth_price_loop())
 
         # Must start BEFORE the listener: telegram_listener.start() ends in
         # run_until_disconnected() and never returns.
@@ -287,6 +301,16 @@ class CopyTraderBot:
             except Exception:
                 self.logger.exception("Pending-entry reconciliation will retry")
 
+    async def _eth_price_loop(self):
+        # Refresh ETH/USD well inside its 60 s cache life, so sizing a buy reads
+        # the cache instead of the price APIs: OMNIBIND's entry waited 7.8 s on them.
+        while True:
+            try:
+                await self.chain_client.get_eth_price_usd(refresh=True)
+            except Exception:
+                pass            # get_eth_price_usd's own stale-price rules still apply
+            await asyncio.sleep(30)
+
     async def on_signal(self, signal: CallSignal):
         start_time = time.time()
         self.logger.info(f"==> Incoming Signal: ${signal.ticker} (DEX: {signal.dex})")
@@ -365,6 +389,9 @@ class CopyTraderBot:
                 self.logger.debug("entry quality check failed: %s", exc)
             log_event("position_opened", **position.to_dict())
             return SignalResult("opened", "verified fill and persisted position")
+        except RugRisk as exc:
+            self.logger.warning(f"Skipping ${signal.ticker}: {exc}")
+            return SignalResult("rejected", str(exc))
         except PreflightFailure as exc:
             return SignalResult("retry", str(exc))
         except ExecutionUncertain as exc:
@@ -395,9 +422,10 @@ class CopyTraderBot:
             await self.telegram_listener.stop()
         await self.launch_watcher.stop()
         await self.signal_queue.stop()
-        if self._recovery_task:
-            self._recovery_task.cancel()
-            await asyncio.gather(self._recovery_task, return_exceptions=True)
+        for task in (self._recovery_task, self._price_task):
+            if task:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
         await self.position_monitor.stop_all()
         report = self.strategy_engine.get_status_report()
         self.logger.info(f"Final Session Summary: {report}")

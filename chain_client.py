@@ -184,9 +184,11 @@ class ChainClient:
         decimals = await self.get_token_decimals(token_address)
         return balance_raw / (10 ** decimals)
 
-    async def get_eth_price_usd(self) -> float:
+    async def get_eth_price_usd(self, refresh: bool = False) -> float:
+        """refresh=True skips the cache: main's background loop uses it so that a
+        buy always finds a warm cache and never waits on these APIs."""
         now = time.time()
-        if self._eth_price_usd and (now - self._eth_price_timestamp) < self._price_cache_ttl:
+        if not refresh and self._eth_price_usd and (now - self._eth_price_timestamp) < self._price_cache_ttl:
             return self._eth_price_usd
 
         timeout = aiohttp.ClientTimeout(total=3)

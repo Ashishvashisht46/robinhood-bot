@@ -23,6 +23,10 @@ class PreflightFailure(RuntimeError):
     pass
 
 
+class RugRisk(PreflightFailure):
+    """The pool's liquidity can be pulled out from under the buy. Not retried."""
+
+
 class ExecutionGuard:
     def __init__(self, config, chain, dex, path=None):
         self.config, self.chain, self.dex = config, chain, dex
