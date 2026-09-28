@@ -5,10 +5,12 @@ import logging
 from execution_guard import ExecutionUncertain, PreflightFailure
 import asyncio
 from chain_client import eip1559_fees
+import re
 import time
 import aiohttp
 from typing import Tuple, Dict, Any, Optional
 from web3 import Web3
+from web3.exceptions import ContractLogicError
 import eth_abi
 
 try:
@@ -30,6 +32,26 @@ from stock_v4_routes import (
     pool_id_from_key,
     encode_v3_path,
 )
+
+def dex_family(label: Optional[str]) -> Optional[str]:
+    """'pons' or 'uniswap' from a call's DEX label, else None (detect everything).
+
+    Labels seen on real calls: 'Pons V2', 'pons_v2', 'Pons', 'uni_v4',
+    'Uniswap V4', 'uni_v3', 'Uniswap V3', 'Uniswap V2', and a long tail of other
+    launchpads that get no shortcut.
+    """
+    s = re.sub(r"[^a-z]", "", str(label or "").lower())
+    if s.startswith("pons"):
+        return "pons"
+    if s.startswith("uni"):
+        return "uniswap"
+    return None
+
+
+# A token's curve() round trip from India takes ~1.1s; the lookup used to give up
+# after 1.0s, then cache the timeout as "not a curve token" for the session. Of 48
+# Pons calls the bot could not route, 25 were still on their curve (2026-09-27).
+CURVE_LOOKUP_TIMEOUT = 4.0
 
 V3_QUOTER_ABI = [
     {"inputs": [{"components": [
@@ -454,35 +476,29 @@ class DexTrader:
             return c_addr, p_tok, False
 
         # 2. Cache Miss Step 1: Direct token.curve() method (Direct O(1) view call on Pons token)
+        uncertain = False       # a timeout or RPC error is not an answer -- see the end
         try:
             curve_sel = self.w3.keccak(text="curve()")[:4].hex()
             res = await asyncio.wait_for(
                 asyncio.to_thread(self.w3.eth.call, {'to': token_cs, 'data': curve_sel}),
-                timeout=1.0
+                timeout=CURVE_LOOKUP_TIMEOUT
             )
             raw_addr = res.hex()
             if len(raw_addr) >= 40 and raw_addr[-40:] != "0"*40:
                 c_addr = self.w3.to_checksum_address('0x' + raw_addr[-40:])
                 p_tok = "0x" + "0"*40
                 is_grad = False
-                try:
-                    pair_sel = self.w3.keccak(text="pairToken()")[:4].hex()
-                    pair_res = await asyncio.to_thread(self.w3.eth.call, {'to': c_addr, 'data': pair_sel})
-                    if len(pair_res.hex()) >= 40:
-                        p_tok = self.w3.to_checksum_address('0x' + pair_res.hex()[-40:])
-                except (ExecutionUncertain, PreflightFailure):
-                    raise
-                except Exception:
-                    pass
-
-                try:
-                    grad_sel = self.w3.keccak(text="graduated()")[:4].hex()
-                    grad_res = await asyncio.to_thread(self.w3.eth.call, {'to': c_addr, 'data': grad_sel})
+                # Independent reads of the same curve: one round trip, not two.
+                pair_sel = self.w3.keccak(text="pairToken()")[:4].hex()
+                grad_sel = self.w3.keccak(text="graduated()")[:4].hex()
+                pair_res, grad_res = await asyncio.gather(
+                    asyncio.to_thread(self.w3.eth.call, {'to': c_addr, 'data': pair_sel}),
+                    asyncio.to_thread(self.w3.eth.call, {'to': c_addr, 'data': grad_sel}),
+                    return_exceptions=True)
+                if not isinstance(pair_res, BaseException) and len(pair_res.hex()) >= 40:
+                    p_tok = self.w3.to_checksum_address('0x' + pair_res.hex()[-40:])
+                if not isinstance(grad_res, BaseException):
                     is_grad = bool(int(grad_res.hex(), 16))
-                except (ExecutionUncertain, PreflightFailure):
-                    raise
-                except Exception:
-                    pass
 
                 if not is_grad:
                     self._curve_cache[token_cs] = (c_addr, p_tok)
@@ -494,8 +510,10 @@ class DexTrader:
                     return None, p_tok, True
         except (ExecutionUncertain, PreflightFailure):
             raise
+        except ContractLogicError:
+            pass                # curve() reverted: the token has none -- a real answer
         except Exception:
-            pass
+            uncertain = True    # timed out or the RPC failed: we learned nothing
 
         # 3. Cache Miss Step 2: Try Bags Lens second (0.6s fast timeout)
         try:
@@ -567,8 +585,11 @@ class DexTrader:
         except Exception as e:
             logger.debug(f"Pons V2 event query failed for {token_cs}: {e}")
 
-        # Mark miss in cache to avoid repeated checks
-        self._curve_cache[token_cs] = (None, "0x" + "0"*40)
+        # Mark miss in cache to avoid repeated checks -- but only a real answer. A
+        # timed-out curve() lookup used to be cached as "not a curve token", so a
+        # live Pons curve stayed invisible for the rest of the session.
+        if not uncertain:
+            self._curve_cache[token_cs] = (None, "0x" + "0"*40)
         return None, "0x" + "0"*40, False
 
     async def is_contract(self, address: str) -> bool:
@@ -586,20 +607,64 @@ class DexTrader:
 
     # ─── Fast On-Chain Decision Tree ────────────────────────────────────
 
-    async def detect_venue_and_route(self, token_address: str) -> Tuple[str, str, str, int]:
+    async def detect_venue_and_route(self, token_address: str, dex_hint: Optional[str] = None) -> Tuple[str, str, str, int]:
         """
         Cached front-door for venue detection. Once a token resolves to a real
         venue, that result is reused for the rest of the run instead of
         re-running the whole detection cascade (DexScreener + on-chain probes)
         on every call — this matters a lot because get_token_price_eth() calls
         this on every price-poll tick for every open position.
+
+        dex_hint is the DEX the call named, if any; see dex_family().
         """
         token_cs = self.w3.to_checksum_address(token_address)
         cached = self._route_cache.get(token_cs)
         if cached is not None:
             return cached
+        # Shielded: the detection is shared, so one waiter giving up must not
+        # cancel it for the others (a prefetch, the buy, a price poll).
+        return await asyncio.shield(self._detection(token_cs, dex_hint))
 
-        result = await self._detect_venue_and_route_uncached(token_cs)
+    def _detection(self, token_cs: str, dex_hint: Optional[str]):
+        """The in-flight detection for a token, started if there is none.
+
+        One per token at a time, so a route prefetched when its call arrived is
+        joined by the buy instead of being searched for twice. The dict holds
+        the task until it finishes, which also keeps it from being collected.
+        """
+        inflight = self.__dict__.setdefault("_detect_inflight", {})
+        task = inflight.get(token_cs)
+        if task is None:
+            task = asyncio.ensure_future(self._detect_and_cache(token_cs, dex_hint))
+            inflight[token_cs] = task
+
+            def _done(t, key=token_cs):
+                inflight.pop(key, None)
+                if not t.cancelled():
+                    t.exception()      # retrieved: a failed prefetch is simply re-run by the buy
+            task.add_done_callback(_done)
+        return task
+
+    def prefetch_route(self, token_address: str, dex_hint: Optional[str] = None) -> None:
+        """
+        Start finding a call's route the moment it arrives, in the background.
+
+        Calls are BOUGHT one at a time -- signal_queue has a single worker, so two
+        buys never race for the wallet's nonce or funds. But route finding is
+        read-only, and it used to run inside that one-at-a-time section: each
+        call waited for every earlier call's route search before starting its
+        own. 17 calls reached the bot within a second of being posted and still
+        expired in line that way. Now routes are found while earlier calls buy.
+        """
+        try:
+            token_cs = self.w3.to_checksum_address(token_address)
+        except Exception:
+            return             # not an address; the buy rejects it properly
+        if token_cs not in self._route_cache:
+            self._detection(token_cs, dex_hint)
+
+    async def _detect_and_cache(self, token_cs: str, dex_hint: Optional[str]) -> Tuple[str, str, str, int]:
+        result = await self._detect_venue_and_route_uncached(token_cs, dex_hint)
 
         # A token cannot be quoted against itself. USDG resolved to
         # UNISWAP_V3_USDG with quote == USDG and priced at 0.5582 ETH -- $1403 for
@@ -784,7 +849,25 @@ class DexTrader:
         async with self._probe_slots:
             return await asyncio.to_thread(function, *args)
 
-    async def _detect_venue_and_route_uncached(self, token_address: str) -> Tuple[str, str, str, int]:
+    def _pons_v4_route(self, token_cs: str, pair_token: str):
+        """
+        A graduated Pons token trades in the pool its graduation created: fee 0,
+        tick spacing 200, the Pons hook, against the curve's own pair token --
+        every Pons graduation measured on 2026-09-27 used exactly that key. So go
+        straight to it instead of searching V3, stock, V2 and native V4; that
+        search took 24s median on Pons calls and then found nothing.
+
+        No liquidity check here: the key is known by construction, and a dead
+        pool is already refused downstream (no quote -> no trade; the simulation
+        catches the rest). Checking here too cost a round trip on every buy.
+        """
+        eth_like = pair_token.lower() in (ZERO.lower(), self.weth_address.lower())
+        quote = ZERO if eth_like else self.w3.to_checksum_address(pair_token)
+        self._remember_v4_key(token_cs, quote, 0, 200, PONS_V2_HOOK)
+        logger.info(f"⚡ Pons graduated route: {token_cs} -> V4 Pons pool vs {quote}")
+        return "UNISWAP_V4", self.uni_router_address, quote, 0
+
+    async def _detect_venue_and_route_uncached(self, token_address: str, dex_hint: Optional[str] = None) -> Tuple[str, str, str, int]:
         """
         Fast Decision Tree (Stops immediately on first valid match):
         0. Fast Check: Verify address is a smart contract (skip EOAs)
@@ -796,6 +879,7 @@ class DexTrader:
         """
         await self.verify_chain_id()
         token_cs = self.w3.to_checksum_address(token_address)
+        family = dex_family(dex_hint)
 
         # Start the three independent probes together. They used to run one after
         # another, so a DexScreener miss -- which is the normal case for a token
@@ -805,12 +889,21 @@ class DexTrader:
         ds_task = asyncio.create_task(
             asyncio.wait_for(asyncio.to_thread(fetch_dexscreener, token_cs), timeout=2.5)
         )
-        curve_task = asyncio.create_task(self.resolve_token_curve(token_cs))
+        # A call naming Uniswap is not a curve token (none of 400+ resolved to
+        # one), and the curve lookup's misses cost ~2-3s before DexScreener's
+        # answer could be used. Skip it.
+        curve_task = (None if family == "uniswap"
+                      else asyncio.create_task(self.resolve_token_curve(token_cs)))
 
         def _drop(*tasks):
             for t in tasks:
-                if not t.done():
+                if t is not None and not t.done():
                     t.cancel()
+
+        def _curve_route(c_addr, pair):
+            if pair.lower() == self.usdg_address.lower():
+                return "LAUNCHPAD_CURVE_USDG", c_addr, self.usdg_address, 0
+            return "LAUNCHPAD_CURVE_ETH", c_addr, ZERO, 0
 
         # ========== FAST FILTER: EOA vs Smart Contract ==========
         if not await contract_task:
@@ -824,18 +917,26 @@ class DexTrader:
         # yet, so it can only be bought on the curve. Check that FIRST, because for
         # a token minutes old -- the snipe case -- DexScreener has not indexed it
         # and waiting on that miss just delays an answer already in hand.
-        try:
-            curve_addr, pair_token, is_graduated = await curve_task
-        except (ExecutionUncertain, PreflightFailure):
-            raise
-        except Exception as e:
-            logger.debug(f"Curve resolution failed for {token_cs}: {e}")
-            curve_addr, pair_token, is_graduated = None, ZERO, False
+        curve_addr, pair_token, is_graduated = None, ZERO, False
+        if curve_task is not None:
+            try:
+                curve_addr, pair_token, is_graduated = await curve_task
+            except (ExecutionUncertain, PreflightFailure):
+                raise
+            except Exception as e:
+                logger.debug(f"Curve resolution failed for {token_cs}: {e}")
+        if family == "pons" and not curve_addr and not is_graduated \
+                and token_cs not in self._curve_cache:
+            # Not cached means the lookup timed out rather than answered. For a
+            # token the call says is Pons, ask again before falling into a search
+            # built for other kinds of token.
+            curve_addr, pair_token, is_graduated = await self.resolve_token_curve(token_cs)
         if curve_addr and not is_graduated:
             _drop(ds_task)
-            if pair_token.lower() == self.usdg_address.lower():
-                return "LAUNCHPAD_CURVE_USDG", curve_addr, self.usdg_address, 0
-            return "LAUNCHPAD_CURVE_ETH", curve_addr, ZERO, 0
+            return _curve_route(curve_addr, pair_token)
+        if family == "pons" and is_graduated:
+            _drop(ds_task)
+            return self._pons_v4_route(token_cs, pair_token)
 
         # ========== 0. ULTRA-FAST DEXSCREENER CHECK (~150ms) ==========
         # IMPORTANT: fetch_dexscreener() uses blocking `requests`, not aiohttp.
@@ -1012,17 +1113,14 @@ class DexTrader:
         )
         calldata = built_tx['data']
 
-        max_fee, max_priority = eip1559_fees(self.w3)
-
+        # No fees or nonce here: send_transaction sets both at signing, always,
+        # so fetching them here was two discarded round trips.
         tx = {
             "from": recipient,
             "to": self.uni_router_address,
             "value": amount_wei,
             "data": calldata,
             "gas": 450000,
-            "maxFeePerGas": max_fee,
-            "maxPriorityFeePerGas": max_priority,
-            "nonce": await self.chain.get_nonce(),
             "chainId": 4663
         }
 
@@ -1431,7 +1529,8 @@ class DexTrader:
         logger.warning("[DRY RUN] No route quote for %s; refusing to invent a fill", token_address)
         return 0.0
 
-    async def buy_token(self, token_address: str, eth_amount: float, slippage_pct: float, start_time: Optional[float] = None) -> Tuple[str, float]:
+    async def buy_token(self, token_address: str, eth_amount: float, slippage_pct: float, start_time: Optional[float] = None,
+                        dex_hint: Optional[str] = None) -> Tuple[str, float]:
         if start_time is None:
             start_time = time.time()
 
@@ -1441,7 +1540,7 @@ class DexTrader:
         recipient = self.chain.account.address if self.chain.account else "0x" + "0"*40
 
         # Step 1: Detect venue and route per decision tree
-        venue, target_addr, quote_asset, fee = await self.detect_venue_and_route(token_address)
+        venue, target_addr, quote_asset, fee = await self.detect_venue_and_route(token_address, dex_hint)
         t_detect = time.time()
         logger.info(f"🔎 Token: {token_address} | Venue: {venue} | Target: {target_addr} | QuoteAsset: {quote_asset} | Fee: {fee} | Detection time: {t_detect - start_time:.2f}s")
         print(f"🔎 Token: {token_address} | Venue: {venue} | Target: {target_addr} | QuoteAsset: {quote_asset} | Fee: {fee}")
@@ -1544,21 +1643,30 @@ class DexTrader:
             print(log_line)
             return f"DRY_RUN_0x{int(time.time())}", await self._dry_run_fill(token_address, eth_amount)
 
-        min_out = await self.min_out_for(
+        # The quote runs in the background from here: everything below that does
+        # not need its number (V4 key resolution, approvals, the simulation, the
+        # balance baseline) happens while it is in flight, instead of after it.
+        quote_task = asyncio.create_task(self.min_out_for(
             venue, token_address, quote_asset, fee, eth_wei, target_addr, slippage_pct
-        )
-        if min_out is None:
-            # No quote means no slippage protection. Sending anyway is how you get
-            # sandwiched for the full stake, so skip the trade instead.
-            logger.error(
-                f"❌ Cannot quote {venue} route for {token_address} -- refusing to buy "
-                f"without slippage protection"
-            )
-            return "", 0.0
+        ))
+        quote_task.add_done_callback(lambda t: t.cancelled() or t.exception())
+
+        async def quoted():
+            m = await quote_task
+            if m is None:
+                # No quote means no slippage protection. Sending anyway is how you
+                # get sandwiched for the full stake, so skip the trade instead.
+                logger.error(
+                    f"❌ Cannot quote {venue} route for {token_address} -- refusing to buy "
+                    f"without slippage protection"
+                )
+            return m
 
         if venue in ["V4", "STOCK_PAIR", "V4_STOCK"]:
             v4_fee, v4_tick, v4_hook = await asyncio.to_thread(
                 self._v4_params_for, token_address, quote_asset, fee)
+            if await quoted() is None:
+                return "", 0.0
             return await self.force_buy_v4_or_stock(
                 token_address, eth_amount, slippage_pct,
                 fee=v4_fee, tick=v4_tick, hook=v4_hook
@@ -1575,6 +1683,8 @@ class DexTrader:
             fee = v4_fee_resolved
 
             if quote_asset.lower() == self.usdg_address.lower():
+                if await quoted() is None:
+                    return "", 0.0
                 # Prefer two-tx ETH->USDG->token to avoid 0x3b99b53d hybrid encode
                 try:
                     if not getattr(self.config, "DRY_RUN", True):
@@ -1605,6 +1715,8 @@ class DexTrader:
             elif self.w3.to_checksum_address(quote_asset) in EXTENDED_STOCK_LIST or quote_asset.lower() not in (self.weth_address.lower(), ZERO.lower(), "0x0000000000000000000000000000000000000000"):
                 if getattr(self.config, "DRY_RUN", True):
                     return f"DRY_RUN_0x{int(time.time())}", await self._dry_run_fill(token_address, eth_amount)
+                if await quoted() is None:
+                    return "", 0.0
                 tick = v4_tick
                 hook = v4_hook
                 bal_before = await self._safe_token_balance(token_address)
@@ -1647,10 +1759,11 @@ class DexTrader:
                 tokens_received = await self._measure_fill(token_address, bal_before)
                 return tx2, tokens_received if tokens_received > 0 else 0.0
             else:
-                tx_v4, cmd_v4 = self.build_v4_swap_tx(
-                    token_address, eth_wei, min_out, recipient, quote_asset, fee=fee, tick=v4_tick, hook=v4_hook
-                )
-                candidate_txs.append((venue, self.uni_router_address, tx_v4, cmd_v4))
+                # Each candidate is a builder of its transaction for a given
+                # floor, so it can be simulated before the quote is back.
+                candidate_txs.append((venue, self.uni_router_address, lambda m: self.build_v4_swap_tx(
+                    token_address, eth_wei, m, recipient, quote_asset, fee=fee, tick=v4_tick, hook=v4_hook
+                )))
 
         elif venue in ["LAUNCHPAD_CURVE_ETH", "LAUNCHPAD_CURVE_USDG"]:
             # If pair is USDG, ensure USDG is approved to curve contract first and msg.value = 0
@@ -1673,22 +1786,24 @@ class DexTrader:
                 except Exception as e:
                     logger.warning(f"USDG approval/balance check to curve {target_addr} failed: {e}")
 
-                tx_c, cmd_c = self.build_curve_buy_tx(target_addr, quote_in_usdg, min_out, recipient, quote_asset)
-                candidate_txs.append((venue, target_addr, tx_c, cmd_c))
+                candidate_txs.append((venue, target_addr, lambda m: self.build_curve_buy_tx(
+                    target_addr, quote_in_usdg, m, recipient, quote_asset)))
             else:
-                tx_c, cmd_c = self.build_curve_buy_tx(target_addr, eth_wei, min_out, recipient, quote_asset)
-                candidate_txs.append((venue, target_addr, tx_c, cmd_c))
+                candidate_txs.append((venue, target_addr, lambda m: self.build_curve_buy_tx(
+                    target_addr, eth_wei, m, recipient, quote_asset)))
 
         elif "UNISWAP_V3" in venue:
-            tx_v3, cmd_v3 = self.build_v3_swap_tx(token_address, eth_wei, min_out, recipient, quote_asset, fee=fee)
-            candidate_txs.append((venue, self.swap_router02_addr, tx_v3, cmd_v3))
+            candidate_txs.append((venue, self.swap_router02_addr, lambda m: self.build_v3_swap_tx(
+                token_address, eth_wei, m, recipient, quote_asset, fee=fee)))
 
         elif "UNISWAP_V2" in venue:
-            calldata = self.v2_router.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
-                min_out, [self.weth_address, token_address], recipient, int(time.time()) + 300
-            )._encode_transaction_data()
-            tx_v2 = {'from': recipient, 'to': UNISWAP_V2_ROUTER, 'value': eth_wei, 'data': calldata, 'chainId': 4663}
-            candidate_txs.append((venue, UNISWAP_V2_ROUTER, tx_v2, "swapExactETHForTokens"))
+            def _v2(m):
+                calldata = self.v2_router.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
+                    m, [self.weth_address, token_address], recipient, int(time.time()) + 300
+                )._encode_transaction_data()
+                return ({'from': recipient, 'to': UNISWAP_V2_ROUTER, 'value': eth_wei,
+                         'data': calldata, 'chainId': 4663}, "swapExactETHForTokens")
+            candidate_txs.append((venue, UNISWAP_V2_ROUTER, _v2))
 
         # Step 2: Check per-venue simulation setting (Kill-Switch Enabled)
         gas_limits = {
@@ -1700,17 +1815,48 @@ class DexTrader:
             "UNISWAP_V2_USDG": 250000
         }
 
-        for v_name, target, tx, cmd_str in candidate_txs:
-            tx['maxFeePerGas'], tx['maxPriorityFeePerGas'] = eip1559_fees(self.w3)
-            tx['gas'] = gas_limits.get(v_name, 350000)
+        def _cancel(*tasks):
+            for t in tasks:
+                if t is not None and not t.done():
+                    t.cancel()
 
+        for v_name, target, make in candidate_txs:
+            gas = gas_limits.get(v_name, 350000)
             skip_sim = (v_name in self.no_sim_venues)
+            # No fee fields here: send_transaction prices the transaction at
+            # signing, always. Pricing it here too was a discarded round trip, and
+            # a blocking one -- it froze the event loop, Telegram listener included.
 
+            sim_task = None
             if not skip_sim:
+                # Simulate WHILE the quote is in flight, with a provisional floor of
+                # 1. The simulation proves route, encoding and approvals; only the
+                # floor waits for the quote. Trade-off: a price move past slippage
+                # between quote and send now reverts on chain (gas only) instead of
+                # in simulation.
+                probe, probe_cmd = make(1)
+                probe['gas'] = gas
                 t_sim_start = time.time()
-                success, sim_result = await self.simulate_execution(tx, v_name, target, cmd_str)
+                sim_task = asyncio.create_task(
+                    self.simulate_execution(probe, v_name, target, probe_cmd))
+            # Query balance BEFORE the transaction for a clean delta -- also while
+            # the quote is in flight, since nothing is sent until both are back.
+            bal_task = asyncio.create_task(self._safe_token_balance(token_address))
+
+            try:
+                min_out = await quoted()
+            except BaseException:
+                _cancel(sim_task, bal_task)
+                raise
+            if min_out is None:
+                _cancel(sim_task, bal_task)
+                return "", 0.0
+
+            if sim_task is not None:
+                success, sim_result = await sim_task
                 t_sim_end = time.time()
                 if not success:
+                    _cancel(bal_task)
                     ms = int((time.time() - start_time) * 1000)
                     log_line = f"{ms}ms | {token_address} | {v_name} | {target} | sent=False | tx=None | status=SIM_FAIL | token_delta=+0.0000 | quote_delta=+0.000000"
                     logger.warning(log_line)
@@ -1720,8 +1866,9 @@ class DexTrader:
             else:
                 logger.info(f"⚡ NO-SIM FAST BROADCAST for {v_name} (proven venue)")
 
-            # Query balance BEFORE transaction to ensure clean delta check
-            bal_before = await self._safe_token_balance(token_address)
+            tx, cmd_str = make(min_out)
+            tx['gas'] = gas
+            bal_before = await bal_task
 
             tx_hash = await self.chain.send_transaction(tx)
             receipt = await self.chain.wait_for_receipt(tx_hash)
@@ -1858,9 +2005,10 @@ class DexTrader:
             logger.warning(f"Fallback detection failed: {e}")
 
         # ==========================================
-        # LAST RESORT: Aggressive no-sim V4 broadcast
+        # LAST RESORT: V4 fallback (quoted and simulated since 958ba7a; it used to
+        # broadcast unsimulated, which is how $LIFE and $SPARKLES reverted)
         # ==========================================
-        logger.warning(f"All simulated routes failed for {token_address}. Attempting no-sim V4 last resort...")
+        logger.warning(f"All simulated routes failed for {token_address}. Trying the simulated V4 fallback...")
         try:
             tx_hash, received = await self.force_buy_v4_or_stock(token_address, eth_amount, slippage_pct)
             if tx_hash and received > 0:
@@ -1868,7 +2016,7 @@ class DexTrader:
         except (ExecutionUncertain, PreflightFailure):
             raise
         except Exception as e:
-            logger.error(f"No-sim V4 last resort failed: {e}")
+            logger.error(f"V4 fallback failed: {e}")
 
         logger.error(f"❌ All buy routes failed for {token_address}")
         return "", 0.0
@@ -2087,7 +2235,7 @@ class DexTrader:
             "UNISWAP_V4": 450000,
         }
 
-        tx['maxFeePerGas'], tx['maxPriorityFeePerGas'] = eip1559_fees(self.w3)
+        # No fee fields: send_transaction prices at signing (see buy_token).
         tx['gas'] = gas_limits.get(venue, 350000)
 
         skip_sim = (venue in self.no_sim_venues)

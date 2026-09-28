@@ -304,6 +304,10 @@ ERC20_ABI = [
     {"inputs": [{"name": "s", "type": "address"}, {"name": "v", "type": "uint256"}], "name": "approve", "outputs": [{"type": "bool"}], "stateMutability": "nonpayable", "type": "function"},
     {"inputs": [{"name": "a", "type": "address"}], "name": "balanceOf", "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
 ]
+# WETH here is Arbitrum's aeWETH behind a proxy (verified on the explorer).
+WETH_ABI = ERC20_ABI + [
+    {"inputs": [{"name": "wad", "type": "uint256"}], "name": "withdraw", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
+]
 
 V3_SWAP_EXACT_IN = 0x00
 WRAP_ETH = 0x0b
@@ -570,7 +574,9 @@ class StockV4Router:
                 raise ExecutionUncertain(f"stock-route broadcast outcome unknown: {tx_hash}") from exc
         return tx_hash
 
-    def _wait_receipt(self, tx_hash, timeout=60):
+    def _wait_receipt(self, tx_hash, timeout=60, allow_revert=False):
+        """allow_revert returns a reverted receipt instead of raising: a revert is
+        a KNOWN outcome, unlike a missing receipt, and the caller may act on it."""
         try:
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
         except (ExecutionUncertain, PreflightFailure):
@@ -580,7 +586,7 @@ class StockV4Router:
         guard = getattr(self, "execution_guard", None)
         if guard:
             guard.receipt(tx_hash, receipt)
-        if receipt.get("status") != 1:
+        if receipt.get("status") != 1 and not allow_revert:
             raise ExecutionUncertain(f"stock-route transaction reverted: {tx_hash}")
         return receipt
 
@@ -744,14 +750,12 @@ class StockV4Router:
         _stock = self.w3.eth.contract(stock, abi=_bal_abi)
         stock_before = _stock.functions.balanceOf(me).call()
 
-        # Leg 2 can revert after leg 1 has already bought the stock, leaving it
-        # stranded in the wallet. Retrying used to re-run leg 1 and buy the stock
-        # AGAIN, doubling the ETH spent. If we are already holding some, use that
-        # instead of buying more.
-        # Existing stock belongs to the wallet, not this new signal. A failed
-        # operation is reconciled explicitly instead of sweeping earlier holdings.
+        # Leg 2 can revert after leg 1 has already bought the stock. Existing stock
+        # belongs to the wallet, not this new signal, so only what leg 1 buys here
+        # is touched -- and if leg 2 fails, exactly that is sold back (_unwind_stock).
         acquired = None
         tx1 = None
+        leg1 = None         # the route leg 1 took, so a failed leg 2 can reverse it
 
         if acquired is None:
             # --- tx1: ETH -> STOCK (1-hop, same as BETA) ---
@@ -762,6 +766,7 @@ class StockV4Router:
                     stock_v3 = f
                     break
             if stock_v3 is not None:
+                leg1 = ("v3", [WETH, stock], [stock_v3])
                 tx1 = self.buy_v3_multihop([WETH, stock], [stock_v3], amount_wei, me, 1, 280000)
             else:
                 usdg_v3 = self._v3_pool(WETH, USDG, 500)
@@ -771,8 +776,10 @@ class StockV4Router:
                         stock_usdg = f
                         break
                 if usdg_v3 and stock_usdg is not None:
+                    leg1 = ("v3", [WETH, USDG, stock], [500, stock_usdg])
                     tx1 = self.buy_v3_multihop([WETH, USDG, stock], [500, stock_usdg], amount_wei, me, 1, 380000)
                 else:
+                    leg1 = ("v4", 500, 10, ZERO)
                     tx1 = self.buy_v4([{
                         "token_in": WETH, "token_out": stock,
                         "amount_in": amount_wei, "min_out": 1,
@@ -787,7 +794,54 @@ class StockV4Router:
             if acquired <= 0:
                 raise RuntimeError(f"tx1 filled no stock: {tx1}")
         stock_bal = acquired
+        try:
+            tx2 = self._stock_leg2(token, stock, stock_bal, token_fee, token_tick, hook)
+            receipt = self._wait_receipt(tx2, timeout=60, allow_revert=True)
+        except ExecutionUncertain:
+            raise        # leg 2 may still land; selling its input now could strand it
+        except Exception as exc:
+            self._unwind_stock(stock, stock_bal, leg1, exc)
+            raise
+        if receipt.get("status") != 1:
+            self._unwind_stock(stock, stock_bal, leg1, f"leg 2 reverted: {tx2}")
+        return tx1, tx2
 
+    def _unwind_stock(self, stock, amount, leg1, why):
+        """Leg 2 failed after leg 1 bought the stock: sell exactly that stock back
+        to ETH through the pool leg 1 used.
+
+        Nothing used to undo leg 1, so the stock stayed in the wallet -- GME, GOOGL
+        and SNOW sat there for weeks -- and the caller's retry re-ran leg 1 and
+        bought more. Best effort: if the unwind fails too, the stock is left for
+        status.py to flag and the original failure stands.
+        """
+        logger.warning(f"Stock leg 2 failed ({why}); unwinding {amount} of {stock} to ETH")
+        me = self.account.address
+        try:
+            weth = self.w3.eth.contract(WETH, abi=WETH_ABI)
+            before = weth.functions.balanceOf(me).call()
+            if leg1[0] == "v3":
+                _, path, fees = leg1
+                tx = self.sell_v3_path(path[::-1], fees[::-1], amount, simulate=True)
+            else:
+                _, fee, tick, hook = leg1
+                tx = self.buy_v4_erc20_in(stock, WETH, amount, 1, fee, tick, hook)
+            self._wait_receipt(tx, timeout=60)
+            got = weth.functions.balanceOf(me).call() - before
+            if got > 0:
+                max_fee, prio = self._gas_fees()
+                wtx = weth.functions.withdraw(got).build_transaction({
+                    "from": me, "maxFeePerGas": max_fee, "maxPriorityFeePerGas": prio,
+                    "nonce": self.w3.eth.get_transaction_count(me), "chainId": CHAIN_ID,
+                })
+                wtx["gas"] = int(self.w3.eth.estimate_gas(wtx) * 1.3)
+                self._wait_receipt(self._send(wtx), timeout=60)
+            logger.info(f"Unwound {amount} of {stock}: {got / 1e18:.8f} ETH back")
+        except Exception as exc:
+            logger.error(f"UNWIND FAILED for {stock}: {exc} -- {amount} is still in the wallet")
+
+    def _stock_leg2(self, token, stock, stock_bal, token_fee, token_tick, hook):
+        me = self.account.address
         # approve Universal Router if needed
         allow_abi = [{
             "inputs": [{"name": "o", "type": "address"}, {"name": "s", "type": "address"}],
@@ -813,11 +867,10 @@ class StockV4Router:
             self._wait_receipt(self._send(atx), timeout=60)
 
         # --- tx2: STOCK -> TOKEN (1-hop V4, value=0, real amount) ---
-        tx2 = self.buy_v4_erc20_in(
+        return self.buy_v4_erc20_in(
             stock, token, stock_bal, 1,
             int(token_fee), int(token_tick), hook
         )
-        return tx1, tx2
 
     def buy_usdg_two_tx(self, token: str, amount_eth: float, token_fee=3000, token_tick=60, token_hook=None,
                         min_out_fn=None):

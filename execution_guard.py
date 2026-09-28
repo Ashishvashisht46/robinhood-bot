@@ -189,7 +189,12 @@ class ExecutionGuard:
                     if operation.get("funding"):
                         result = await self.inventory.execute(operation["funding"], self)
                     else:
-                        result = await self.dex.buy_token(token, amount, slippage, start_time=start_time)
+                        # The DEX the call named lets detection skip searches that
+                        # cannot apply (see dex_trader.dex_family). Passed only when
+                        # present, so callers and fakes without it are unchanged.
+                        hint = operation["context"].get("dex")
+                        result = await self.dex.buy_token(token, amount, slippage, start_time=start_time,
+                                                          **({"dex_hint": hint} if hint else {}))
                 else:
                     result = await self.dex.sell_token(token, amount, slippage)
                 tx_hash, filled = result

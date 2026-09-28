@@ -239,7 +239,6 @@ class ChainClient:
         if not self.account:
             raise ValueError("No private key configured")
 
-        tx["nonce"] = await self.get_nonce()
         if "gas" not in tx:
             tx["gas"] = await self.estimate_gas(tx)
         if "chainId" not in tx:
@@ -252,12 +251,20 @@ class ChainClient:
         # and the price that actually shipped was one computed before an
         # eth_estimateGas round trip that can take seconds under RPC throttling.
         # Signing is the last safe moment to price a transaction, so price it here.
+        #
+        # The pending nonce and the fee are both fetched here, at the last moment,
+        # but TOGETHER: they are independent, and fetching them one after the
+        # other cost an extra ~1.1s round trip from India on every transaction.
+        # Not cached across trades on purpose -- a manual trade from a wallet app
+        # (which happens on this wallet) would make a cached nonce collide.
         if "gasPrice" not in tx:
             headroom = max(2.0, float(getattr(self.config, "GAS_MULTIPLIER", 1.3)))
-            max_fee, priority = await asyncio.to_thread(
-                eip1559_fees, self.w3, headroom)
+            tx["nonce"], (max_fee, priority) = await asyncio.gather(
+                self.get_nonce(), asyncio.to_thread(eip1559_fees, self.w3, headroom))
             tx["maxFeePerGas"] = max_fee
             tx["maxPriorityFeePerGas"] = priority
+        else:
+            tx["nonce"] = await self.get_nonce()
 
         signed_tx = self.w3.eth.account.sign_transaction(tx, private_key=self.account.key)
         raw_tx_bytes = getattr(signed_tx, "raw_transaction", getattr(signed_tx, "rawTransaction", None))

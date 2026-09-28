@@ -220,7 +220,10 @@ class CopyTraderBot:
             )
 
     async def enqueue_signal(self, signal):
-        self.signal_queue.submit(signal)
+        # Calls are bought one at a time; find this one's route now, while the
+        # calls ahead of it are still buying, so it does not expire in line.
+        if self.signal_queue.submit(signal) and signal.contract_address:
+            self.dex_trader.prefetch_route(signal.contract_address, signal.dex)
 
     def _position_from_operation(self, operation, filled):
         context = operation["context"]
@@ -308,7 +311,7 @@ class CopyTraderBot:
                 start_time=start_time,
                 entry_check=lambda: self.strategy_engine.get_trade_decision(signal, eth_price) == decision,
                 context=dict(ticker=signal.ticker, message_id=signal.message_id, stake_usd=decision.stake_usd,
-                             check_wallet_funds=True,
+                             check_wallet_funds=True, dex=signal.dex,
                              expires_at=(signal.timestamp.replace(tzinfo=timezone.utc) if signal.timestamp.tzinfo is None
                                          else signal.timestamp).timestamp() + self.config.MAX_SIGNAL_AGE_SECONDS))
             operation = self.execution.last_operation
