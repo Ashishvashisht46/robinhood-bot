@@ -120,6 +120,12 @@ class StrategyEngine:
         """Public save point for callers that mutate a live position (partial fills)."""
         self._save_state()
 
+    def below_min_mcap(self, signal) -> bool:
+        """The $29k rule (AD-048). A call with no stated market cap is skipped too:
+        14 such calls, from the older message format, won 7%."""
+        floor = getattr(self.config, "MIN_CALL_MCAP_USD", 0)
+        return bool(floor) and (signal.mcap_usd is None or signal.mcap_usd < floor)
+
     def get_trade_decision(self, signal: CallSignal, eth_price_usd: float) -> TradeDecision:
         if self.state_load_error:
             return TradeDecision(False, 0.0, 0.0, self.state, "State needs repair before new entries")
@@ -157,6 +163,9 @@ class StrategyEngine:
 
         if signal.dex and "long" in str(signal.dex).lower():
             return TradeDecision(False, 0.0, 0.0, self.state, "Skipping Longxyz (Proprietary signature-gated launchpad)")
+        if self.below_min_mcap(signal):
+            return TradeDecision(False, 0.0, 0.0, self.state,
+                                 f"Market cap under ${self.config.MIN_CALL_MCAP_USD / 1000:g}k at the call")
 
         stake_usd = self.config.BASELINE_STAKE_USD if (self.state == StrategyState.BASELINE or not getattr(self.config, "ENABLE_COMPOUNDING", False)) else self.config.COMPOUND_STAKE_USD
         if hasattr(self.config, "BUFFER_GATE_USD") and self.config.BUFFER_GATE_USD > 0 and self.balance_usd < self.config.BUFFER_GATE_USD:

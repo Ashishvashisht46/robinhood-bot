@@ -52,6 +52,12 @@ class CopyTraderBot:
             self.config.MAX_CONCURRENT_POSITIONS = 10_000
             self.config.SAFETY_FLOOR_USD = self.config.GAS_RESERVE_USD = 0.0
             self.config.MAX_DAILY_LOSS_USD, self.config.MAX_CONSECUTIVE_LOSSES = 0.0, 0   # 0 = off
+            # The strategy under test (AD-048/049): skip calls posted under $29k
+            # mcap; sell 70% at 1.2x and 25% at 1.3x, and let 5% ride. On the 24
+            # past $29k+ calls that split made +$1.01/trade vs -$4.32 for 40/40/20.
+            self.config.MIN_CALL_MCAP_USD = float(os.getenv("PAPER_MIN_CALL_MCAP_USD") or 29_000)
+            self.config.TP1_MULTIPLIER, self.config.TP1_RATIO = 1.2, 0.70
+            self.config.TP2_MULTIPLIER, self.config.TP2_RATIO = 1.3, 0.25
         # The pretend wallet: topped up to this at every paper start, so a losing
         # run never runs out of money. Paper P&L is the ledger's, not this balance.
         paper_capital = float(os.getenv("PAPER_CAPITAL_USD") or 10_000) if paper else None
@@ -236,7 +242,9 @@ class CopyTraderBot:
     async def enqueue_signal(self, signal):
         # Calls are bought one at a time; find this one's route now, while the
         # calls ahead of it are still buying, so it does not expire in line.
-        if self.signal_queue.submit(signal) and signal.contract_address:
+        # Not for a call the $29k rule will skip: that search is only RPC load.
+        if self.signal_queue.submit(signal) and signal.contract_address \
+                and not self.strategy_engine.below_min_mcap(signal):
             self.dex_trader.prefetch_route(signal.contract_address, signal.dex)
 
     def _position_from_operation(self, operation, filled):

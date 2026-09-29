@@ -261,12 +261,15 @@ class LatencyTests(unittest.IsolatedAsyncioTestCase):
         bot = object.__new__(CopyTraderBot)
         bot.dex_trader = SimpleNamespace(prefetch_route=Mock())
         call = SimpleNamespace(contract_address=self.TOKEN, dex="Pons V2")
-        for accepted, has_ca, expect in ((True, True, 1), (False, True, 0), (True, False, 0)):
+        # The last case is a call the $29k rule will skip: no route search for it.
+        for accepted, has_ca, skipped, expect in ((True, True, False, 1), (False, True, False, 0),
+                                                  (True, False, False, 0), (True, True, True, 0)):
             bot.dex_trader.prefetch_route.reset_mock()
             bot.signal_queue = SimpleNamespace(submit=Mock(return_value=accepted))
+            bot.strategy_engine = SimpleNamespace(below_min_mcap=lambda s, skipped=skipped: skipped)
             call.contract_address = self.TOKEN if has_ca else None
             await bot.enqueue_signal(call)
-            self.assertEqual(bot.dex_trader.prefetch_route.call_count, expect, (accepted, has_ca))
+            self.assertEqual(bot.dex_trader.prefetch_route.call_count, expect, (accepted, has_ca, skipped))
 
     def buying_trader(self, quote):
         dex = self.trader()

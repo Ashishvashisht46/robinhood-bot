@@ -114,6 +114,17 @@ class RiskTests(unittest.TestCase):
         candidate.sell_tax = 20
         self.assertEqual(self.engine.get_trade_decision(candidate, 2500).reason, "High tax")
 
+    def test_calls_under_the_mcap_floor_are_skipped(self):
+        # AD-048: under $29k, 26% of calls won; at or above it, 75%.
+        self.cfg.MIN_CALL_MCAP_USD = 29_000
+        low, high, unknown = signal(), signal(), signal()          # the test call says $20k
+        high.mcap_usd, unknown.mcap_usd = 35_000, None
+        self.assertEqual(self.engine.get_trade_decision(low, 2500).reason, "Market cap under $29k at the call")
+        self.assertTrue(self.engine.get_trade_decision(high, 2500).should_trade)
+        self.assertFalse(self.engine.get_trade_decision(unknown, 2500).should_trade)
+        self.cfg.MIN_CALL_MCAP_USD = 0                             # off, as in live until switched on
+        self.assertTrue(self.engine.get_trade_decision(low, 2500).should_trade)
+
     def test_profit_does_not_automatically_double_stake(self):
         self.engine.record_trade_result(Position(pnl_usd=1), True)
         self.assertEqual(self.engine.state, StrategyState.BASELINE)

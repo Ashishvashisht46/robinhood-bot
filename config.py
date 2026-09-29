@@ -58,6 +58,9 @@ class Config:
         self.MAX_BUY_TAX: float = float(os.getenv("MAX_BUY_TAX", "0"))
         self.MAX_SELL_TAX: float = float(os.getenv("MAX_SELL_TAX", "0"))
         self.MIN_HOLDERS: int = int(os.getenv("MIN_HOLDERS", "30"))
+        # Skip calls posted below this market cap; 0 = off. AD-048: under $29k,
+        # 26% of calls won; at or above it, 75%.
+        self.MIN_CALL_MCAP_USD: float = float(os.getenv("MIN_CALL_MCAP_USD", "0"))
         self.MAX_TOKEN_AGE_MINUTES: int = int(os.getenv("MAX_TOKEN_AGE_MINUTES", "60"))
 
         self.SLIPPAGE_PCT: float = float(os.getenv("SLIPPAGE_PCT", "15"))
@@ -120,7 +123,8 @@ class Config:
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
         for name in ("SAFETY_FLOOR_USD", "GAS_RESERVE_USD", "MAX_DAILY_LOSS_USD", "MAX_CONSECUTIVE_LOSSES",
-                     "MAX_BUY_TAX", "MAX_SELL_TAX", "MIN_LIQUIDITY_USD", "MIN_HOLDERS", "PAPER_FEE_PER_SWAP_USD"):
+                     "MAX_BUY_TAX", "MAX_SELL_TAX", "MIN_LIQUIDITY_USD", "MIN_HOLDERS", "PAPER_FEE_PER_SWAP_USD",
+                     "MIN_CALL_MCAP_USD"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
         if not 0 <= self.SLIPPAGE_PCT < 100:
